@@ -6,3 +6,5 @@
 1. clangd无法找到OPENCV库头文件，导致include命令下有红色波浪线。在GPT帮助下配置了.vscode文件夹下的settings.json和CMakeLists的库路径，虽然麻烦但是应该后续项目可以复用，且不会对运行速度造成影响。
 
 ## 所收获的
+1. 对图片的常见处理
+2. git的命令行操作
