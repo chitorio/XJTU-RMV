@@ -126,47 +126,19 @@ void detectLightBar(const Mat& src, Mat &dst) {
 
     // 中值滤波
     Mat medianImg;
-    medianBlur(gray, medianImg, 5);
+    medianBlur(gray, medianImg, 15);
     imwrite("output/img2_median.png", medianImg);
 
-    // 自适应阈值处理
-    Mat adaptive;
-    adaptiveThreshold(medianImg, adaptive, 255, ADAPTIVE_THRESH_GAUSSIAN_C, THRESH_BINARY, 11, 2);
+    Mat binary;
+    threshold(medianImg, binary, 220, 255, THRESH_BINARY);
 
-    // hsv转换
-    Mat hsv;
-    cvtColor(src, hsv, COLOR_BGR2HSV);
-    // // 蓝色阈值
-    // Scalar blueLow(100, 120, 100);
-    // Scalar blueHigh(140, 255, 255);
-    // Mat mask_blue;
-    // inRange(hsv, blueLow, blueHigh, mask_blue);
-
-    // // 白色阈值
-    // Scalar whiteLow(0, 0, 240);
-    // Scalar whiteHigh(150, 30, 255);
-    // Mat mask_white;
-    // inRange(hsv, whiteLow, whiteHigh, mask_white);
-
-    // // Mat mask = mask_blue | mask_white;
-
-    // Mat mask = mask_white;
-
-    // 亮度掩码
-    vector<Mat> hsvCh;
-    split(hsv, hsvCh);
-    Mat value = hsvCh[2];
-    Mat brightMask;
-    double brightThresh = 250;
-    threshold(value, brightMask, brightThresh, 255, THRESH_BINARY);
-    // mask = mask & brightMask;
-    Mat mask = brightMask;
+    Mat mask = binary;
 
     imwrite("output/img2_beforemask.png", mask);
 
     // 形态学去噪（先开后闭）
     Mat dilateImg, erodeImg, morphImg;
-    Mat kernel = getStructuringElement(MORPH_RECT, Size(5, 5));
+    Mat kernel = getStructuringElement(MORPH_RECT, Size(10, 10));
 
     dilate(mask, dilateImg, kernel);
     erode(dilateImg, erodeImg, kernel);
@@ -190,7 +162,7 @@ void detectLightBar(const Mat& src, Mat &dst) {
 
     for (auto& cont : contours) {
         double area = contourArea(cont);
-        if (area < 500) continue; // 面积筛选
+        if (area < 400) continue; // 面积筛选
 
         // 椭圆拟合筛选
         if (cont.size() < 5) continue; // 点数太少无法拟合椭圆
@@ -203,7 +175,7 @@ void detectLightBar(const Mat& src, Mat &dst) {
 
         // 椭圆长宽比和面积筛选
         if (ellipseRatio < 1.2 || ellipseRatio > 10.0) continue;
-        if (ellipseArea < 1300) continue;
+        if (ellipseArea < 100) continue;
 
         RotatedRect r = minAreaRect(cont);
         float w = r.size.width, h = r.size.height;
@@ -213,7 +185,6 @@ void detectLightBar(const Mat& src, Mat &dst) {
 
         float ratio = longSide / shortSide;
         if (ratio < 2.0 || ratio > 10.0) continue;  // 长宽比筛选
-        lightBars.push_back(r);
 
         // 角度规范化
         float angle = normalizedAngle(r);
@@ -238,12 +209,12 @@ void detectLightBar(const Mat& src, Mat &dst) {
             if (fabs(ratios[i] - ratios[j]) > 0.5) continue;
 
             // 面积接近
-            if (fabs(areas[i] - areas[j]) > 50) continue;
+            if (fabs(areas[i] - areas[j]) > 100) continue;
 
             // 生成装甲板矩形
             Point2f center = (lightBars[i].center + lightBars[j].center) * 0.5f;
-            float width = norm(lightBars[i].center - lightBars[j].center);
-            float height = (lightBars[i].size.height + lightBars[j].size.height) * 0.5f;
+            float height = norm(lightBars[i].center - lightBars[j].center);
+            float width = (lightBars[i].size.height + lightBars[j].size.height) * 2.0;
             float angle = (angles[i] + angles[j]) * 0.5f;
 
             RotatedRect armorRect(center, Size2f(width, height), angle);
