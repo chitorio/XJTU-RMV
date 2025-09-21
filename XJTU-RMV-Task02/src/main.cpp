@@ -109,82 +109,130 @@ Mat cropTopLeftQuarter(const Mat& src) {
 
 // 检测装甲板
 void detectLightBar(const Mat& src, bool is_blue = true) {
+    Mat img;
+    src.copyTo(img);
 
-    // 变量集中定义
-    Mat channels[3], binary, Gaussian, dilatee;
-    Mat element = getStructuringElement(MORPH_RECT, Size(5, 5));
-    Rect boundRect;
-    RotatedRect box;
-    vector<vector<Point>> contours;
-    vector<Vec4i> hierarchy;
-    vector<Point2f> boxPts(4);
+    // 颜色空间与扣图
+    Mat hsv;
+    cvtColor(img, hsv, COLOR_BGR2HSV);
+    Mat mask1, mask2, mask;
 
-    // 图像预处理
-    split(src, channels);   // 分离通道
-    threshold(channels[0], binary, 220, 255, 0); // 二值化
-    GaussianBlur(binary, Gaussian, Size(5, 5), 0); // 高斯滤波
-    dilate(Gaussian, dilatee, element); // 膨胀
-    findContours(dilatee, contours, hierarchy, RETR_EXTERNAL, CHAIN_APPROX_SIMPLE); // 轮廓检测
-    
-    // 筛选灯条
-    vector<float> widths, lengths, angles, areas;
-    vector<Point2f> centers;
-
-    for (int i = 0; i < contours.size(); i++) {
-        // if (contours[i].empty()) continue;
-        
-        double area = contourArea(contours[i]);
-        
-        // 面积筛选
-        if (area < 5 || contours[i].size() < 5) continue;
-
-        // 椭圆拟合
-        RotatedRect Light_Rec = fitEllipse(contours[i]);
-
-        // 长宽比和面积比筛选
-        if (Light_Rec.size.width / Light_Rec.size.height > 4) continue;
-        
-        widths.push_back(Light_Rec.size.width);
-        lengths.push_back(Light_Rec.size.height);
-        angles.push_back(Light_Rec.angle);
-        areas.push_back(area);
-        centers.push_back(Light_Rec.center);
+    if (is_blue) {
+        inRange(hsv, Scalar(95, 80, 120), Scalar(135, 255, 255), mask);
+    } else {
+        inRange(hsv, Scalar(0, 90, 120), Scalar(10, 255, 255), mask1);
+        inRange(hsv, Scalar(170, 90, 120), Scalar(180, 255, 255), mask2);
+        mask = mask1 | mask2;
     }
 
-    // 灯条两两匹配
-    for (size_t i = 0; i < centers.size(); i++) {
-        for (size_t j = i + 1; j < centers.size(); j++) {
-            float angleGap_ = abs(angles[i] - angles[j]);
-            float LenGap_ratio = abs(lengths[i] - lengths[j]) / max(lengths[i], lengths[j]);
-            float dis = sqrt(pow(centers[i].x - centers[j].x, 2) + pow(centers[i].y - centers[j].y, 2));
-            float meanLen = (lengths[i] + lengths[j]) / 2;
-            float lengap_ratio = (lengths[i] - lengths[j]) / meanLen;
-            float yGap = abs(centers[i].y - centers[j].y);
-            float yGap_ratio = yGap / meanLen;
-            float xGap = abs(centers[i].x - centers[j].x);
-            float xGap_ratio = xGap / meanLen;
-            float ratio = dis / meanLen;
+    // 去小噪声：先开后闭
+    Mat kernel_v = getStructuringElement(MORPH_RECT, Size(3, 9));
+    morphologyEx(mask, mask, MORPH_OPEN, kernel_v, Point(-1, -1), 1);
+    morphologyEx(mask, mask, MORPH_CLOSE, kernel_v, Point(-1, -1), 1);
 
-            // 匹配条件
-            if (angleGap_ > 15 || LenGap_ratio > 1.0 || lengap_ratio > 0.8 || yGap_ratio > 1.5 || xGap_ratio > 2.2 || xGap_ratio < 0.8 || ratio > 3 || ratio < 0.8) {
-                continue;
-            }
+    // 查找轮廓
+    vector<vector<Point>> contours;
+    vector<Vec4i> hier;
+    findContours(mask, contours, hier, RETR_EXTERNAL, CHAIN_APPROX_SIMPLE);
 
-            // 绘制匹配矩形
-            Point center = Point((centers[i].x + centers[j].x) / 2, (centers[i].y + centers[j].y) / 2);
-            RotatedRect rect = RotatedRect(center, Size(dis, meanLen), (angles[i] + angles[j]) / 2);
-            Point2f vertices[4];
-            rect.points(vertices);
-            for (int k = 0; k < 4; k++) {
-                line(src, vertices[k], vertices[(k + 1) % 4], Scalar(0, 255, 0), 2);
-            }
+    struct LightBar {
+        RotatedRect rr;
+        float len, wid, angle;  // angle归一到[0,90]
+        Point2f center;
+    }; vector<LightBar> bars;
+
+    for (auto& c : contours) {
+        if (c.size() < 5) continue;
+        RotatedRect r = minAreaRect(c);
+        float w = min(r.size.width, r.size.height);
+        float h = max(r.size.width, r.size.height);
+        float area = contourArea(c);
+        if (area < 30) continue;
+        float ratio = h / max(w, 1.0f);
+        if (ratio < 3.0f || h < 8) continue;
+        float ang = r.angle;
+        if (r.size.height >= r.size.width) {
+            ang = abs(ang + 90.f);
+        } else {
+            ang = abs(ang);
+        }
+        if (ang > 25) continue;
+
+        bars.push_back({r, h, w, ang, r.center});
+    }
+
+    // 配对+打分
+    struct PairCand {
+        int i, j;
+        float score;
+        RotatedRect armor;
+    }; vector<PairCand> pairs;
+
+    auto armorForm2 = [](const LightBar& a, const LightBar& b) {
+        Point2f c((a.center.x + b.center.x) / 2.f, (a.center.y + b.center.y) / 2.f);
+        float meanLen = 0.5f * (a.len + b.len);
+        float meanWid = 0.5f * (a.wid + b.wid);
+        float dx = abs(a.center.x - b.center.x);
+        float dy = abs(a.center.y - b.center.y);
+        float angle = 0.5f * (a.rr.angle + b.rr.angle);
+
+        if (angle < -90) angle += 180;
+        if (angle > 90) angle -= 180;
+        float width = dx + meanWid;
+        float height = meanLen;
+        return RotatedRect(c, Size2f(width, height), angle);
+    };
+
+    for (int i = 0; i < (int)bars.size(); ++i) {
+        for (int j = i + 1; j < (int)bars.size(); ++j) {
+            const auto& A = bars[i], & B = bars[j];
+            float len_sim = abs(A.len - B.len) / max(A.len, B.len);
+            float ang_sim = abs(A.angle - B.angle);
+            float dx = abs(A.center.x - B.center.x);
+            float dy = abs(A.center.y - B.center.y);
+            float meanLen = 0.5f * (A.len + B.len);
+            float ratio = dx / max(meanLen, 1.0f);
+
+            // 几何先验
+            if (len_sim > 0.35f) continue;
+            if (ang_sim > 12.0f) continue;
+            if (dy/meanLen > 0.4f) continue;
+            if (ratio < 0.3f || ratio > 3.5f) continue;
+
+            // 打分
+            float score = 2.0f*len_sim + 0.5f*(ang_sim/12.0f) + 0.8f*(dy/meanLen) + 0.6f*abs(ratio-1.2f);
+            pairs.push_back({i, j, score, armorForm2(A, B)});
         }
     }
 
-    imwrite("output/img2_result.png", src);
+    // 选分最低的
+    sort(pairs.begin(), pairs.end(), [](auto& a, auto& b){return a.score < b.score;});
+    vector<RotatedRect> armors;
+    for (auto& p : pairs) {
+        bool keep = true;
+        for (auto& q : armors) {
+            Point2f pc = p.armor.center, qc = q.center;
+            if (norm(pc - qc) < 0.5f*(p.armor.size.width + q.size.width)) {
+                keep =false;
+                break;
+            }
+        }
+        if (keep) armors.push_back(p.armor);
+    }
 
-    cout << "Detected " << centers.size() << " light bars." << endl;
+    // 可视化
+    for (auto& b : bars) {
+        Point2f v[4];
+        b.rr.points(v);
+        for (int k = 0; k < 4; ++k) line(img, v[k], v[(k+1)%4], Scalar(0, 255, 255), 2);
+    }
+    for (auto& r : armors) {
+        Point2f v[4];
+        r.points(v);
+        for (int k = 0; k < 4; ++k) line(img, v[k], v[(k+1)%4], Scalar(0, 255, 0), 3);
+    }
 
+    imwrite("output/img2_result.png", img);
 }
 
 // ----- 主函数部分 -----
