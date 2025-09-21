@@ -1,5 +1,6 @@
 #include <cmath>
 #include <cstddef>
+#include <cstdlib>
 #include <iostream>
 #include <opencv2/core.hpp>
 #include <opencv2/core/mat.hpp>
@@ -106,119 +107,84 @@ Mat cropTopLeftQuarter(const Mat& src) {
     return src(roi).clone();
 }
 
-// 返回以长边为基准的角度
-static float normalizedAngle(const RotatedRect& r) {
-    float w = r.size.width, h = r.size.height, ang = r.angle;
-    if (w < h) ang += 90.0f;
-    if (ang >= 180.0f) ang -= 180.0f;
-    return ang;
-}
-
 // 检测装甲板
-void detectLightBar(const Mat& src, Mat &dst) {
-    dst = src.clone();
+void detectLightBar(const Mat& src, bool is_blue = true) {
 
-    // hsv转换
-    Mat hsv;
-    cvtColor(src, hsv, COLOR_BGR2HSV);
-
-    // 蓝色阈值
-    Scalar blueLow(100, 120, 100);
-    Scalar blueHigh(140, 255, 255);
-    Mat mask_blue;
-    inRange(hsv, blueLow, blueHigh, mask_blue);
-
-    // 白色阈值
-    Scalar whiteLow(0, 0, 240);
-    Scalar whiteHigh(150, 30, 255);
-    Mat mask_white;
-    inRange(hsv, whiteLow, whiteHigh, mask_white);
-
-    // Mat mask = mask_blue | mask_white;
-
-    Mat mask = mask_white;
-
-    // 亮度掩码
-    vector<Mat> hsvCh;
-    split(hsv, hsvCh);
-    Mat value = hsvCh[2];
-    Mat brightMask;
-    double brightThresh = 250;
-    threshold(value, brightMask, brightThresh, 255, THRESH_BINARY);
-    mask = mask & brightMask;
-
-    imwrite("output/img2_beforemask.png", mask);
-
-    // 中值滤波
-    medianBlur(mask, mask, 5);
-
-    // 形态学去噪
-    Mat kernel = getStructuringElement(MORPH_RECT, Size(3, 3));
-    morphologyEx(mask, mask, MORPH_OPEN, kernel);
-    morphologyEx(mask, mask, MORPH_CLOSE, kernel);
-
-    // 保存掩码
-    imwrite("output/img2_mask.png", mask);
-
-    // 找轮廓+筛选灯条
+    // 变量集中定义
+    Mat channels[3], binary, Gaussian, dilatee;
+    Mat element = getStructuringElement(MORPH_RECT, Size(5, 5));
+    Rect boundRect;
+    RotatedRect box;
     vector<vector<Point>> contours;
-    findContours(mask, contours, RETR_EXTERNAL, CHAIN_APPROX_SIMPLE);
+    vector<Vec4i> hierarchy;
+    vector<Point2f> boxPts(4);
 
-    vector<RotatedRect> lightBars;
-    vector<float> angles;
-    vector<float> areas;
-    vector<float> ratios;
+    // 图像预处理
+    split(src, channels);   // 分离通道
+    threshold(channels[0], binary, 220, 255, 0); // 二值化
+    GaussianBlur(binary, Gaussian, Size(5, 5), 0); // 高斯滤波
+    dilate(Gaussian, dilatee, element); // 膨胀
+    findContours(dilatee, contours, hierarchy, RETR_EXTERNAL, CHAIN_APPROX_SIMPLE); // 轮廓检测
+    
+    // 筛选灯条
+    vector<float> widths, lengths, angles, areas;
+    vector<Point2f> centers;
 
-    for (auto& cont : contours) {
-        double area = contourArea(cont);
-        if (area < 100 || area > 400) continue; // 面积筛选（可调）
+    for (int i = 0; i < contours.size(); i++) {
+        // if (contours[i].empty()) continue;
+        
+        double area = contourArea(contours[i]);
+        
+        // 面积筛选
+        if (area < 5 || contours[i].size() < 5) continue;
 
-        RotatedRect r = minAreaRect(cont);
-        float w = r.size.width, h = r.size.height;
-        float longSide = max(w, h), shortSide = min(w, h);
-        if (shortSide < 1.0) continue; // 去掉过窄
+        // 椭圆拟合
+        RotatedRect Light_Rec = fitEllipse(contours[i]);
 
-        float ratio = longSide / shortSide;
-        if (ratio < 2.0 || ratio > 20.0) continue;  // 长宽比筛选（可调）
-        lightBars.push_back(r);
-
-        // 角度规范化
-        float angle = normalizedAngle(r);
-
-        lightBars.push_back(r);
-        angles.push_back(angle);
-        areas.push_back((float)area);
-        ratios.push_back(ratio);
+        // 长宽比和面积比筛选
+        if (Light_Rec.size.width / Light_Rec.size.height > 4) continue;
+        
+        widths.push_back(Light_Rec.size.width);
+        lengths.push_back(Light_Rec.size.height);
+        angles.push_back(Light_Rec.angle);
+        areas.push_back(area);
+        centers.push_back(Light_Rec.center);
     }
 
-    // 配对灯条+框选装甲板
-    for (size_t i = 0; i < lightBars.size(); i++) {
-        for (size_t j = i + 1; j < lightBars.size(); j++) {
-            // 角度接近
-            if (fabs(angles[i] - angles[j]) > 10.0) continue;
+    // 灯条两两匹配
+    for (size_t i = 0; i < centers.size(); i++) {
+        for (size_t j = i + 1; j < centers.size(); j++) {
+            float angleGap_ = abs(angles[i] - angles[j]);
+            float LenGap_ratio = abs(lengths[i] - lengths[j]) / max(lengths[i], lengths[j]);
+            float dis = sqrt(pow(centers[i].x - centers[j].x, 2) + pow(centers[i].y - centers[j].y, 2));
+            float meanLen = (lengths[i] + lengths[j]) / 2;
+            float lengap_ratio = (lengths[i] - lengths[j]) / meanLen;
+            float yGap = abs(centers[i].y - centers[j].y);
+            float yGap_ratio = yGap / meanLen;
+            float xGap = abs(centers[i].x - centers[j].x);
+            float xGap_ratio = xGap / meanLen;
+            float ratio = dis / meanLen;
 
-            // 长宽比接近
-            if (fabs(ratios[i] - ratios[j]) > 0.5) continue;
+            // 匹配条件
+            if (angleGap_ > 15 || LenGap_ratio > 1.0 || lengap_ratio > 0.8 || yGap_ratio > 1.5 || xGap_ratio > 2.2 || xGap_ratio < 0.8 || ratio > 3 || ratio < 0.8) {
+                continue;
+            }
 
-            // 面积接近
-            if (fabs(areas[i] - areas[j]) > 50) continue;
-
-            // 生成装甲板矩形
-            Point2f center = (lightBars[i].center + lightBars[j].center) * 0.5f;
-            float width = norm(lightBars[i].center - lightBars[j].center);
-            float height = (lightBars[i].size.height + lightBars[j].size.height) * 0.5f;
-            float angle = (angles[i] + angles[j]) * 0.5f;
-
-            RotatedRect armorRect(center, Size2f(width, height), angle);
-
-            // 画出装甲板
-            Point2f pts[4];
-            armorRect.points(pts);
+            // 绘制匹配矩形
+            Point center = Point((centers[i].x + centers[j].x) / 2, (centers[i].y + centers[j].y) / 2);
+            RotatedRect rect = RotatedRect(center, Size(dis, meanLen), (angles[i] + angles[j]) / 2);
+            Point2f vertices[4];
+            rect.points(vertices);
             for (int k = 0; k < 4; k++) {
-                line(dst, pts[k], pts[(k+1)%4], Scalar(0, 0, 255), 2);
+                line(src, vertices[k], vertices[(k + 1) % 4], Scalar(0, 255, 0), 2);
             }
         }
     }
+
+    imwrite("output/img2_result.png", src);
+
+    cout << "Detected " << centers.size() << " light bars." << endl;
+
 }
 
 // ----- 主函数部分 -----
@@ -269,11 +235,10 @@ int main() {
         cerr << "Error: Could not open or find the image2!" << endl;
         return -1;
     }
+    
+    bool is_blue = true;
+    detectLightBar(img2, is_blue);
 
-    Mat result2;
-    detectLightBar(img2, result2);
-
-    imwrite("output/img2_result.png", result2);
     cout << "TARGET ACQUIRED!" << endl;
 
     return 0;
