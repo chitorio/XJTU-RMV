@@ -6,21 +6,18 @@
 #include <cmath>
 using namespace std;
 using namespace cv;
-// ---------- 配置 ----------
 const double VIDEO_FPS = 60.0;
 const double G_MIN = 100.0;
 const double G_MAX = 1000.0;
 const double K_MIN = 0.01;
 const double K_MAX = 1.0;
 const int USE_FIRST_N_FRAMES_FOR_INIT = 8;
-// ---------- 工具函数 ----------
 inline double sigmoid(double u) {
     return 1.0 / (1.0 + std::exp(-u));
 }
 inline double inv_sigmoid(double s) {
     return std::log(s / (1.0 - s));
 }
-// ---------- 自动微分成本函数 ----------
 struct TrajResidual {
     TrajResidual(double t, double x_obs, double y_obs, double x0, double y0, int img_height)
         : t_(t), x_obs_(x_obs), y_obs_(y_obs), x0_(x0), y0_(y0), img_height_(img_height) {}
@@ -39,9 +36,7 @@ struct TrajResidual {
         T vy = vy0[0];
         T exp_term = ceres::exp(-k * t);        
         T x_pred = T(x0_) + vx / k * (T(1.0) - exp_term);
-        // y方向：使用物理坐标系
         T y_pred_physics = T(y0_) + (vy + g / k) / k * (T(1.0) - exp_term) - g / k * t;
-        // 将物理坐标转换回图像坐标（y轴向下）
         T y_pred_image = T(img_height_) - y_pred_physics;
         residuals[0] = x_pred - T(x_obs_);
         residuals[1] = y_pred_image - T(y_obs_);
@@ -53,7 +48,6 @@ private:
     const double x0_, y0_;
     const int img_height_;
 };
-// ---------- 亮球检测 ----------
 bool detectProjectileCentroid(const Mat& frame, double &cx, double &cy) {
     Mat gray;
     if (frame.channels() == 3) cvtColor(frame, gray, COLOR_BGR2GRAY);
@@ -77,21 +71,19 @@ bool detectProjectileCentroid(const Mat& frame, double &cx, double &cy) {
     cy = m.m01 / m.m00;
     return true;
 }
-// ---------- main函数 ----------
 int main() {
     string video_path = "./TASK03/video.mp4";
     VideoCapture cap(video_path);
     double fps = cap.get(CAP_PROP_FPS);
-    // 获取图像高度用于坐标转换
     Mat first_frame;
     cap.read(first_frame);
     cap.set(CAP_PROP_POS_FRAMES, 0);
     int img_height = first_frame.rows;
     vector<double> times;
-    vector<double> xs, ys;  // 存储图像坐标系坐标
+    vector<double> xs, ys;
     Mat frame;
     int frame_idx = 0;
-    double x0_img = 0, y0_img = 0;  // 图像坐标系初始位置
+    double x0_img = 0, y0_img = 0;
     bool have_x0 = false;
     while (cap.read(frame)) {
         double cx, cy;
@@ -108,17 +100,14 @@ int main() {
         ys.push_back(cy);      // 图像坐标系y
         frame_idx++;
     }
-    // 将初始位置转换为物理坐标系（y轴向上）
     double x0_physics = x0_img;
     double y0_physics = img_height - y0_img;
-    // 初值估计
     int n_init = min<int>(USE_FIRST_N_FRAMES_FOR_INIT, times.size()-1);
     double sum_vx = 0, sum_vy = 0;
     int count = 0;
     for (int i=0;i<n_init;i++) {
         double dt = times[i+1] - times[i];
         if (dt <= 0) continue;        
-        // 将坐标转换为物理坐标系
         double x1_img = xs[i+1], y1_img = ys[i+1];
         double x0_img = xs[i], y0_img = ys[i];        
         double x1_physics = x1_img;
@@ -155,7 +144,6 @@ int main() {
     options.num_threads = 4;
     ceres::Solver::Summary summary;
     ceres::Solve(options, &problem, &summary);
-    // 映射回实际参数
     double g_final = G_MIN + (G_MAX - G_MIN) * sigmoid(u_g);
     double k_final = K_MIN + (K_MAX - K_MIN) * sigmoid(u_k);
     cout << "=== 拟合结果（物理坐标系）===" << endl;
