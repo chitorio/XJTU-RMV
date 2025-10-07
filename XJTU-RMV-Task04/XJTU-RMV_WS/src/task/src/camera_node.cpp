@@ -1,572 +1,526 @@
-#include <rclcpp/rclcpp.hpp>
-#include <sensor_msgs/msg/image.hpp>
-#include <image_transport/image_transport.hpp>
-#include <camera_info_manager/camera_info_manager.hpp>
 #include "MvCameraControl.h"
+// ROS
+#include <camera_info_manager/camera_info_manager.hpp>
+#include <image_transport/image_transport.hpp>
+#include <rclcpp/logging.hpp>
+#include <rclcpp/rclcpp.hpp>
+#include <rclcpp/utilities.hpp>
+#include <sensor_msgs/msg/camera_info.hpp>
+#include <sensor_msgs/msg/image.hpp>
+
+#include <atomic>
+#include <chrono>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
-#include <stdexcept>
-#include <chrono>
-#include <functional>
+
+namespace hik_camera
+{
 
 class HikCameraNode : public rclcpp::Node
 {
 public:
-    HikCameraNode() : Node("camera_node")
-    {
-        RCLCPP_INFO(this->get_logger(), "Initializing Hikvision Camera Node...");
+  explicit HikCameraNode(const rclcpp::NodeOptions & options) : Node("hik_camera_node", options)
+  {
+    RCLCPP_INFO(this->get_logger(), "Starting HikCameraNode!");
 
-        // 声明参数
-        declare_parameters();
-        
-        // 初始化ROS接口
-        initialize_ros_interfaces();
-        
-        // 初始化相机信息管理器
-        initialize_camera_info_manager();
-        
-        // 连接相机
-        if (!connect_camera()) {
-            throw std::runtime_error("Failed to connect to camera");
-        }
-        
-        // 配置相机参数
-        if (!configure_camera_parameters()) {
-            throw std::runtime_error("Failed to configure camera parameters");
-        }
-        
-        // 启动采集
-        if (!start_grabbing()) {
-            throw std::runtime_error("Failed to start image grabbing");
-        }
-        
-        // 创建定时器用于图像采集
-        setup_timer();
-        
-        RCLCPP_INFO(this->get_logger(), "Hikvision Camera Node initialized successfully");
+    // 声明所有参数
+    declareParameters();
+
+    // 初始化SDK
+    if (MV_CC_Initialize() != MV_OK) {
+      RCLCPP_FATAL(this->get_logger(), "Failed to initialize Hikvision SDK!");
+      return;
     }
 
-    ~HikCameraNode()
-    {
-        cleanup();
+    // 启动相机管理线程
+    camera_manager_thread_ = std::thread(&HikCameraNode::cameraManager, this);
+
+    RCLCPP_INFO(this->get_logger(), "HikCameraNode initialized successfully!");
+  }
+
+  ~HikCameraNode() override
+  {
+    running_ = false;
+    
+    if (camera_manager_thread_.joinable()) {
+      camera_manager_thread_.join();
     }
+    
+    if (capture_thread_.joinable()) {
+      capture_thread_.join();
+    }
+    
+    closeCamera();
+    MV_CC_Finalize();
+    
+    RCLCPP_INFO(this->get_logger(), "HikCameraNode destroyed!");
+  }
 
 private:
-    // 成员变量
-    void* camera_handle_ = nullptr;
-    bool is_connected_ = false;
-    bool is_grabbing_ = false;
+  void declareParameters()
+  {
+    // 相机识别参数
+    this->declare_parameter("camera_serial", "");
+    this->declare_parameter("camera_ip", "");
     
-    std::shared_ptr<image_transport::ImageTransport> image_transport_;
-    image_transport::Publisher image_publisher_;
-    image_transport::CameraPublisher camera_publisher_;
-    std::shared_ptr<camera_info_manager::CameraInfoManager> camera_info_manager_;
+    // 发布设置
+    this->declare_parameter("frame_id", "camera_optical_frame");
+    this->declare_parameter("image_topic", "image_raw");
+    this->declare_parameter("use_sensor_data_qos", true);
+    this->declare_parameter("camera_name", "hik_camera");
+    this->declare_parameter("camera_info_url", "");
     
-    rclcpp::TimerBase::SharedPtr grab_timer_;
-    rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr parameters_callback_handle_;
+    // 采集参数
+    this->declare_parameter("frame_rate", 30.0);
+    this->declare_parameter("width", 0);
+    this->declare_parameter("height", 0);
+    this->declare_parameter("pixel_format", "bgr8");
     
-    std::unique_ptr<unsigned char[]> image_buffer_;
-    unsigned int buffer_size_ = 0;
+    // 相机控制参数
+    this->declare_parameter("exposure_time", 10000.0);
+    this->declare_parameter("gain", 0.0);
+    this->declare_parameter("auto_exposure", false);
+    this->declare_parameter("auto_gain", false);
     
-    // 参数缓存
-    struct CameraParams {
-        double exposure_time = 8000.0;
-        double gain = 5.0;
-        double frame_rate = 30.0;
-        std::string pixel_format = "bgr8";
-        int64_t width = 640;
-        int64_t height = 480;
-        std::string camera_name = "camera";
-        std::string camera_frame_id = "camera_optical_frame";
-        std::string camera_info_url = "";
-    } current_params_;
+    // 重连设置
+    this->declare_parameter("reconnect_interval", 2.0);
+    this->declare_parameter("max_reconnect_attempts", 0);
+    
+    // 注册参数回调
+    params_callback_handle_ = this->add_on_set_parameters_callback(
+      std::bind(&HikCameraNode::parametersCallback, this, std::placeholders::_1));
+  }
 
-    void declare_parameters()
-    {
-        // 相机基本参数
-        this->declare_parameter("exposure_time", current_params_.exposure_time);
-        this->declare_parameter("gain", current_params_.gain);
-        this->declare_parameter("frame_rate", current_params_.frame_rate);
-        this->declare_parameter("pixel_format", current_params_.pixel_format);
-        this->declare_parameter("width", current_params_.width);
-        this->declare_parameter("height", current_params_.height);
+  void cameraManager()
+  {
+    int reconnect_attempts = 0;
+    
+    while (rclcpp::ok() && running_) {
+      if (!camera_connected_) {
+        RCLCPP_INFO(this->get_logger(), "Attempting to connect to camera...");
         
-        // ROS相关参数
-        this->declare_parameter("camera_name", current_params_.camera_name);
-        this->declare_parameter("camera_frame_id", current_params_.camera_frame_id);
-        this->declare_parameter("camera_info_url", current_params_.camera_info_url);
-        
-        // 从参数服务器获取最新值
-        this->get_parameter("camera_name", current_params_.camera_name);
-        this->get_parameter("camera_frame_id", current_params_.camera_frame_id);
-        this->get_parameter("camera_info_url", current_params_.camera_info_url);
-    }
-
-    void initialize_ros_interfaces()
-    {
-        // 创建图像传输
-        image_transport_ = std::make_shared<image_transport::ImageTransport>(shared_from_this());
-        
-        // 创建图像发布器
-        image_publisher_ = image_transport_->advertise("image_raw", 10);
-        camera_publisher_ = image_transport_->advertiseCamera("image", 10);
-        
-        // 注册参数回调
-        parameters_callback_handle_ = this->add_on_set_parameters_callback(
-            std::bind(&HikCameraNode::on_parameters_changed, this, std::placeholders::_1));
-    }
-
-    void initialize_camera_info_manager()
-    {
-        camera_info_manager_ = std::make_shared<camera_info_manager::CameraInfoManager>(
-            this, current_params_.camera_name, current_params_.camera_info_url);
-        
-        // 加载相机标定信息
-        if (camera_info_manager_->validateURL(current_params_.camera_info_url)) {
-            if (camera_info_manager_->loadCameraInfo(current_params_.camera_info_url)) {
-                RCLCPP_INFO(this->get_logger(), "Loaded camera calibration from: %s", 
-                           current_params_.camera_info_url.c_str());
-            } else {
-                RCLCPP_WARN(this->get_logger(), "Failed to load camera calibration from: %s", 
-                           current_params_.camera_info_url.c_str());
-            }
+        if (connectToCamera()) {
+          if (configureCamera() && startGrabbing()) {
+            camera_connected_ = true;
+            reconnect_attempts = 0;
+            startCaptureThread();
+            RCLCPP_INFO(this->get_logger(), "Camera connected and started successfully!");
+          } else {
+            closeCamera();
+          }
         } else {
-            RCLCPP_INFO(this->get_logger(), "Using default camera calibration");
+          reconnect_attempts++;
+          RCLCPP_WARN(this->get_logger(), "Failed to connect to camera (attempt %d)", reconnect_attempts);
+          
+          double reconnect_interval = this->get_parameter("reconnect_interval").as_double();
+          int max_attempts = this->get_parameter("max_reconnect_attempts").as_int();
+          
+          if (max_attempts > 0 && reconnect_attempts >= max_attempts) {
+            RCLCPP_FATAL(this->get_logger(), "Max reconnect attempts (%d) reached!", max_attempts);
+            rclcpp::shutdown();
+            break;
+          }
+          
+          std::this_thread::sleep_for(std::chrono::milliseconds(static_cast<int>(reconnect_interval * 1000)));
         }
+      } else {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      }
+    }
+  }
+
+  bool connectToCamera()
+  {
+    MV_CC_DEVICE_INFO_LIST device_list;
+    memset(&device_list, 0, sizeof(MV_CC_DEVICE_INFO_LIST));
+
+    // 枚举设备（支持GigE和USB）
+    int ret = MV_CC_EnumDevices(MV_GIGE_DEVICE | MV_USB_DEVICE, &device_list);
+    if (ret != MV_OK) {
+      RCLCPP_ERROR(this->get_logger(), "Enum devices failed! ret[0x%x]", ret);
+      return false;
     }
 
-    bool connect_camera()
-    {
-        RCLCPP_INFO(this->get_logger(), "Searching for cameras...");
-        
-        MV_CC_DEVICE_INFO_LIST device_list;
-        memset(&device_list, 0, sizeof(MV_CC_DEVICE_INFO_LIST));
-        
-        int ret = MV_CC_EnumDevices(MV_GIGE_DEVICE | MV_USB_DEVICE, &device_list);
-        if (ret != MV_OK) {
-            RCLCPP_ERROR(this->get_logger(), "EnumDevices failed: 0x%x", ret);
-            return false;
-        }
-        
-        if (device_list.nDeviceNum == 0) {
-            RCLCPP_ERROR(this->get_logger(), "No cameras found");
-            return false;
-        }
-        
-        RCLCPP_INFO(this->get_logger(), "Found %d camera(s)", device_list.nDeviceNum);
+    RCLCPP_INFO(this->get_logger(), "Found %d camera(s)", device_list.nDeviceNum);
 
-        // 选择第一个设备
-        ret = MV_CC_CreateHandle(&camera_handle_, device_list.pDeviceInfo[0]);
-        if (ret != MV_OK) {
-            RCLCPP_ERROR(this->get_logger(), "CreateHandle failed: 0x%x", ret);
-            return false;
-        }
-
-        ret = MV_CC_OpenDevice(camera_handle_);
-        if (ret != MV_OK) {
-            RCLCPP_ERROR(this->get_logger(), "OpenDevice failed: 0x%x", ret);
-            MV_CC_DestroyHandle(camera_handle_);
-            camera_handle_ = nullptr;
-            return false;
-        }
-
-        is_connected_ = true;
-        RCLCPP_INFO(this->get_logger(), "Camera connected successfully");
-        return true;
+    if (device_list.nDeviceNum == 0) {
+      RCLCPP_ERROR(this->get_logger(), "No cameras found!");
+      return false;
     }
 
-    bool configure_camera_parameters()
-    {
-        if (!is_connected_) return false;
+    // 获取配置参数
+    std::string target_serial = this->get_parameter("camera_serial").as_string();
+    std::string target_ip = this->get_parameter("camera_ip").as_string();
 
-        bool success = true;
+    // 查找指定相机
+    int target_index = -1;
+    for (unsigned int i = 0; i < device_list.nDeviceNum; i++) {
+      MV_CC_DEVICE_INFO* device_info = device_list.pDeviceInfo[i];
+      
+      // 通过IP匹配（GigE设备）
+      if (!target_ip.empty() && device_info->nTLayerType == MV_GIGE_DEVICE) {
+        char current_ip[16] = {0};
+        unsigned int ip_val = device_info->SpecialInfo.stGigEInfo.nCurrentIp;
+        snprintf(current_ip, sizeof(current_ip), "%d.%d.%d.%d",
+                (ip_val >> 24) & 0xff, (ip_val >> 16) & 0xff,
+                (ip_val >> 8) & 0xff, ip_val & 0xff);
         
-        // 设置触发模式为连续采集
-        int ret = MV_CC_SetEnumValue(camera_handle_, "TriggerMode", MV_TRIGGER_MODE_OFF);
-        if (ret != MV_OK) {
-            log_camera_error(ret, "Set TriggerMode to Off");
-            success = false;
+        std::string current_ip_str(current_ip);
+        if (target_ip == current_ip_str) {
+          target_index = i;
+          RCLCPP_INFO(this->get_logger(), "Found camera by IP: %s", current_ip);
+          break;
         }
-
-        // 设置分辨率
-        ret = MV_CC_SetIntValueEx(camera_handle_, "Width", current_params_.width);
-        if (ret != MV_OK) {
-            log_camera_error(ret, "Set Width");
-            success = false;
-        }
-        
-        ret = MV_CC_SetIntValueEx(camera_handle_, "Height", current_params_.height);
-        if (ret != MV_OK) {
-            log_camera_error(ret, "Set Height");
-            success = false;
-        }
-
-        // 设置其他参数
-        ret = MV_CC_SetFloatValue(camera_handle_, "ExposureTime", current_params_.exposure_time);
-        if (ret != MV_OK) {
-            log_camera_error(ret, "Set ExposureTime");
-            success = false;
-        }
-        
-        ret = MV_CC_SetFloatValue(camera_handle_, "Gain", current_params_.gain);
-        if (ret != MV_OK) {
-            log_camera_error(ret, "Set Gain");
-            success = false;
+      }
+      
+      // 通过序列号匹配
+      if (!target_serial.empty()) {
+        std::string serial_number;
+        if (device_info->nTLayerType == MV_GIGE_DEVICE) {
+          serial_number = std::string(reinterpret_cast<const char*>(device_info->SpecialInfo.stGigEInfo.chSerialNumber));
+        } else if (device_info->nTLayerType == MV_USB_DEVICE) {
+          serial_number = std::string(reinterpret_cast<const char*>(device_info->SpecialInfo.stUsb3VInfo.chSerialNumber));
         }
         
-        ret = MV_CC_SetFloatValue(camera_handle_, "AcquisitionFrameRate", current_params_.frame_rate);
-        if (ret != MV_OK) {
-            log_camera_error(ret, "Set AcquisitionFrameRate");
-            success = false;
+        if (target_serial == serial_number) {
+          target_index = i;
+          RCLCPP_INFO(this->get_logger(), "Found camera by serial: %s", serial_number.c_str());
+          break;
         }
-
-        // 设置像素格式
-        unsigned int pixel_format = pixel_format_string_to_enum(current_params_.pixel_format);
-        if (pixel_format != 0) {
-            ret = MV_CC_SetEnumValue(camera_handle_, "PixelFormat", pixel_format);
-            if (ret != MV_OK) {
-                log_camera_error(ret, "Set PixelFormat");
-                success = false;
-            }
-        }
-
-        // 分配图像缓冲区
-        if (!allocate_image_buffer()) {
-            success = false;
-        }
-
-        return success;
+      }
     }
 
-    bool start_grabbing()
-    {
-        if (!is_connected_) return false;
-
-        int ret = MV_CC_StartGrabbing(camera_handle_);
-        if (ret != MV_OK) {
-            RCLCPP_ERROR(this->get_logger(), "StartGrabbing failed: 0x%x", ret);
-            return false;
-        }
-
-        is_grabbing_ = true;
-        RCLCPP_INFO(this->get_logger(), "Image grabbing started");
-        return true;
+    // 如果没有指定相机，使用第一个可用相机
+    if (target_index == -1) {
+      target_index = 0;
+      RCLCPP_INFO(this->get_logger(), "Using first available camera");
     }
 
-    void stop_grabbing()
-    {
-        if (is_grabbing_ && camera_handle_) {
-            MV_CC_StopGrabbing(camera_handle_);
-            is_grabbing_ = false;
-            RCLCPP_INFO(this->get_logger(), "Image grabbing stopped");
-        }
+    // 创建设备句柄
+    int ret_handle = MV_CC_CreateHandle(&camera_handle_, device_list.pDeviceInfo[target_index]);
+    if (ret_handle != MV_OK) {
+      RCLCPP_ERROR(this->get_logger(), "Create handle failed! ret[0x%x]", ret_handle);
+      return false;
     }
 
-    void setup_timer()
-    {
-        // 根据帧率设置定时器周期
-        double timer_period_ms = 1000.0 / current_params_.frame_rate;
-        
-        grab_timer_ = this->create_wall_timer(
-            std::chrono::milliseconds(static_cast<int>(timer_period_ms)),
-            std::bind(&HikCameraNode::grab_and_publish_image, this)
-        );
-        
-        RCLCPP_INFO(this->get_logger(), "Image grab timer set to %.2f ms period", timer_period_ms);
+    // 打开设备
+    int ret_open = MV_CC_OpenDevice(camera_handle_);
+    if (ret_open != MV_OK) {
+      RCLCPP_ERROR(this->get_logger(), "Open device failed! ret[0x%x]", ret_open);
+      MV_CC_DestroyHandle(camera_handle_);
+      camera_handle_ = nullptr;
+      return false;
     }
 
-    void grab_and_publish_image()
-    {
-        if (!is_connected_ || !is_grabbing_) {
-            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000, 
-                               "Camera not ready, attempting reconnection...");
-            attempt_reconnection();
-            return;
+    RCLCPP_INFO(this->get_logger(), "Camera connected successfully");
+    return true;
+  }
+
+  bool configureCamera()
+  {
+    // 设置触发模式为连续采集
+    int ret = MV_CC_SetEnumValue(camera_handle_, "TriggerMode", 0);
+    if (ret != MV_OK) {
+      RCLCPP_WARN(this->get_logger(), "Set trigger mode failed! ret[0x%x]", ret);
+    }
+
+    // 设置帧率
+    double frame_rate = this->get_parameter("frame_rate").as_double();
+    ret = MV_CC_SetFloatValue(camera_handle_, "AcquisitionFrameRate", frame_rate);
+    if (ret != MV_OK) {
+      RCLCPP_WARN(this->get_logger(), "Set frame rate failed! ret[0x%x]", ret);
+    }
+
+    // 设置图像尺寸
+    int width = this->get_parameter("width").as_int();
+    int height = this->get_parameter("height").as_int();
+    if (width > 0 && height > 0) {
+      int ret_width = MV_CC_SetIntValueEx(camera_handle_, "Width", static_cast<int64_t>(width));
+      int ret_height = MV_CC_SetIntValueEx(camera_handle_, "Height", static_cast<int64_t>(height));
+      if (ret_width != MV_OK || ret_height != MV_OK) {
+        RCLCPP_WARN(this->get_logger(), "Set image size failed, using default size");
+      }
+    }
+
+    // 设置曝光模式
+    bool auto_exposure = this->get_parameter("auto_exposure").as_bool();
+    ret = MV_CC_SetEnumValue(camera_handle_, "ExposureAuto", auto_exposure ? 1 : 0);
+    if (ret != MV_OK) {
+      RCLCPP_WARN(this->get_logger(), "Set exposure auto failed! ret[0x%x]", ret);
+    }
+
+    if (!auto_exposure) {
+      double exposure_time = this->get_parameter("exposure_time").as_double();
+      ret = MV_CC_SetFloatValue(camera_handle_, "ExposureTime", exposure_time);
+      if (ret != MV_OK) {
+        RCLCPP_WARN(this->get_logger(), "Set exposure time failed! ret[0x%x]", ret);
+      }
+    }
+
+    // 设置增益模式
+    bool auto_gain = this->get_parameter("auto_gain").as_bool();
+    ret = MV_CC_SetEnumValue(camera_handle_, "GainAuto", auto_gain ? 1 : 0);
+    if (ret != MV_OK) {
+      RCLCPP_WARN(this->get_logger(), "Set gain auto failed! ret[0x%x]", ret);
+    }
+
+    if (!auto_gain) {
+      double gain = this->get_parameter("gain").as_double();
+      ret = MV_CC_SetFloatValue(camera_handle_, "Gain", gain);
+      if (ret != MV_OK) {
+        RCLCPP_WARN(this->get_logger(), "Set gain failed! ret[0x%x]", ret);
+      }
+    }
+
+    // 设置像素格式
+    std::string pixel_format = this->get_parameter("pixel_format").as_string();
+    unsigned int pixel_format_enum = PixelType_Gvsp_BGR8_Packed; // 默认
+    
+    if (pixel_format == "bgr8") {
+      pixel_format_enum = PixelType_Gvsp_BGR8_Packed;
+    } else if (pixel_format == "rgb8") {
+      pixel_format_enum = PixelType_Gvsp_RGB8_Packed;
+    } else if (pixel_format == "mono8") {
+      pixel_format_enum = PixelType_Gvsp_Mono8;
+    } else {
+      RCLCPP_WARN(this->get_logger(), "Unsupported pixel format: %s, using bgr8", pixel_format.c_str());
+    }
+
+    ret = MV_CC_SetEnumValue(camera_handle_, "PixelFormat", pixel_format_enum);
+    if (ret != MV_OK) {
+      RCLCPP_WARN(this->get_logger(), "Set pixel format failed! ret[0x%x]", ret);
+    }
+
+    RCLCPP_INFO(this->get_logger(), "Camera configured successfully");
+    return true;
+  }
+
+  bool startGrabbing()
+  {
+    int ret = MV_CC_StartGrabbing(camera_handle_);
+    if (ret != MV_OK) {
+      RCLCPP_ERROR(this->get_logger(), "Start grabbing failed! ret[0x%x]", ret);
+      return false;
+    }
+
+    RCLCPP_INFO(this->get_logger(), "Image grabbing started");
+    return true;
+  }
+
+  void stopGrabbing()
+  {
+    if (camera_handle_) {
+      MV_CC_StopGrabbing(camera_handle_);
+    }
+  }
+
+  void closeCamera()
+  {
+    if (camera_handle_) {
+      stopGrabbing();
+      MV_CC_CloseDevice(camera_handle_);
+      MV_CC_DestroyHandle(camera_handle_);
+      camera_handle_ = nullptr;
+    }
+    camera_connected_ = false;
+  }
+
+  void startCaptureThread()
+  {
+    // 初始化图像发布器（在连接成功后）
+    bool use_sensor_data_qos = this->get_parameter("use_sensor_data_qos").as_bool();
+
+    // 修复QoS配置 - 确保可靠性
+    rclcpp::QoS qos_profile = use_sensor_data_qos ? 
+                            rclcpp::SensorDataQoS() : 
+                            rclcpp::QoS(10);
+    qos_profile.reliable();  // 确保可靠性策略匹配
+
+    std::string image_topic = this->get_parameter("image_topic").as_string();
+
+    // 使用新的QoS配置创建发布器
+    camera_pub_ = image_transport::create_camera_publisher(
+        this, 
+        image_topic, 
+        qos_profile.get_rmw_qos_profile()
+    );
+
+    // 初始化相机信息管理器
+    std::string camera_name = this->get_parameter("camera_name").as_string();
+    std::string camera_info_url = this->get_parameter("camera_info_url").as_string();
+    camera_info_manager_ = std::make_unique<camera_info_manager::CameraInfoManager>(this, camera_name);
+
+    if (!camera_info_url.empty() && camera_info_manager_->validateURL(camera_info_url)) {
+        camera_info_manager_->loadCameraInfo(camera_info_url);
+        RCLCPP_INFO(this->get_logger(), "Loaded camera info from: %s", camera_info_url.c_str());
+    } else {
+        RCLCPP_WARN(this->get_logger(), "Using default camera info");
+    }
+
+    // 启动采集线程
+    capture_thread_ = std::thread(&HikCameraNode::captureImages, this);
+  }
+
+  void captureImages()
+  {
+    MV_FRAME_OUT out_frame;
+    int fail_count = 0;
+    const int max_fail_count = 5;
+
+    RCLCPP_INFO(this->get_logger(), "Starting image capture thread");
+
+    // 初始化图像消息
+    sensor_msgs::msg::Image image_msg;
+    std::string frame_id = this->get_parameter("frame_id").as_string();
+    image_msg.header.frame_id = frame_id;
+
+    // 初始化像素转换参数
+    MV_CC_PIXEL_CONVERT_PARAM convert_param;
+    memset(&convert_param, 0, sizeof(MV_CC_PIXEL_CONVERT_PARAM));
+
+    while (rclcpp::ok() && running_ && camera_connected_) {
+      int ret = MV_CC_GetImageBuffer(camera_handle_, &out_frame, 1000);
+      
+      if (MV_OK == ret) {
+        // 配置转换参数
+        convert_param.nWidth = out_frame.stFrameInfo.nWidth;
+        convert_param.nHeight = out_frame.stFrameInfo.nHeight;
+        convert_param.pSrcData = out_frame.pBufAddr;
+        convert_param.nSrcDataLen = out_frame.stFrameInfo.nFrameLen;
+        convert_param.enSrcPixelType = out_frame.stFrameInfo.enPixelType;
+        convert_param.enDstPixelType = PixelType_Gvsp_BGR8_Packed; // 统一转换为BGR8
+
+        // 设置图像消息参数
+        image_msg.header.stamp = this->now();
+        image_msg.height = out_frame.stFrameInfo.nHeight;
+        image_msg.width = out_frame.stFrameInfo.nWidth;
+        image_msg.step = out_frame.stFrameInfo.nWidth * 3; // BGR8
+        image_msg.encoding = "bgr8";
+        
+        // 调整数据缓冲区大小
+        size_t required_size = image_msg.step * image_msg.height;
+        if (image_msg.data.size() != required_size) {
+          image_msg.data.resize(required_size);
         }
 
-        MV_FRAME_OUT_INFO_EX frame_info;
-        memset(&frame_info, 0, sizeof(MV_FRAME_OUT_INFO_EX));
-        
-        int ret = MV_CC_GetOneFrameTimeout(camera_handle_, image_buffer_.get(), 
-                                         buffer_size_, &frame_info, 1000);
+        convert_param.pDstBuffer = image_msg.data.data();
+        convert_param.nDstBufferSize = image_msg.data.size();
 
-        if (ret == MV_OK) {
-            publish_image(frame_info);
+        // 转换像素格式
+        int convert_ret = MV_CC_ConvertPixelType(camera_handle_, &convert_param);
+        if (convert_ret == MV_OK) {
+          // 发布图像
+          auto camera_info_msg = camera_info_manager_->getCameraInfo();
+          camera_info_msg.header = image_msg.header;
+          camera_pub_.publish(image_msg, camera_info_msg);
+          
+          fail_count = 0;
         } else {
-            RCLCPP_ERROR(this->get_logger(), "GetOneFrameTimeout failed: 0x%x", ret);
-            handle_camera_error();
+          RCLCPP_WARN(this->get_logger(), "Pixel conversion failed! ret[0x%x]", convert_ret);
         }
-    }
 
-    void publish_image(const MV_FRAME_OUT_INFO_EX& frame_info)
-    {
-        auto image_msg = std::make_unique<sensor_msgs::msg::Image>();
-        auto camera_info_msg = std::make_unique<sensor_msgs::msg::CameraInfo>();
+        MV_CC_FreeImageBuffer(camera_handle_, &out_frame);
+      } else {
+        RCLCPP_WARN(this->get_logger(), "Get image buffer failed! ret[0x%x]", ret);
+        fail_count++;
         
-        // 设置消息头
-        auto stamp = this->get_clock()->now();
-        image_msg->header.stamp = stamp;
-        image_msg->header.frame_id = current_params_.camera_frame_id;
-        
-        // 设置图像基本信息
-        image_msg->height = frame_info.nHeight;
-        image_msg->width = frame_info.nWidth;
-        image_msg->data.resize(frame_info.nFrameLen);
-        
-        // 根据像素格式设置编码和步长
-        std::string encoding;
-        if (frame_info.enPixelType == PixelType_Gvsp_Mono8) {
-            encoding = "mono8";
-            image_msg->step = frame_info.nWidth;
-        } else if (frame_info.enPixelType == PixelType_Gvsp_BGR8_Packed) {
-            encoding = "bgr8";
-            image_msg->step = frame_info.nWidth * 3;
-        } else if (frame_info.enPixelType == PixelType_Gvsp_RGB8_Packed) {
-            encoding = "rgb8";
-            image_msg->step = frame_info.nWidth * 3;
+        if (fail_count >= max_fail_count) {
+          RCLCPP_ERROR(this->get_logger(), "Too many consecutive failures, disconnecting camera");
+          camera_connected_ = false;
+          closeCamera();
+          break;
+        }
+      }
+    }
+    
+    RCLCPP_INFO(this->get_logger(), "Image capture thread exiting");
+  }
+
+  rcl_interfaces::msg::SetParametersResult parametersCallback(
+    const std::vector<rclcpp::Parameter> & parameters)
+  {
+    rcl_interfaces::msg::SetParametersResult result;
+    result.successful = true;
+
+    for (const auto & param : parameters) {
+      if (!camera_connected_) {
+        result.successful = false;
+        result.reason = "Camera not connected, cannot set parameter: " + param.get_name();
+        continue;
+      }
+
+      if (param.get_name() == "exposure_time") {
+        bool auto_exposure = this->get_parameter("auto_exposure").as_bool();
+        if (!auto_exposure) {
+          int status = MV_CC_SetFloatValue(camera_handle_, "ExposureTime", param.as_double());
+          if (MV_OK == status) {
+            RCLCPP_INFO(this->get_logger(), "Exposure time set to: %.1f", param.as_double());
+          } else {
+            result.successful = false;
+            result.reason = "Failed to set exposure time, status = " + std::to_string(status);
+          }
+        }
+      } else if (param.get_name() == "gain") {
+        bool auto_gain = this->get_parameter("auto_gain").as_bool();
+        if (!auto_gain) {
+          int status = MV_CC_SetFloatValue(camera_handle_, "Gain", param.as_double());
+          if (MV_OK == status) {
+            RCLCPP_INFO(this->get_logger(), "Gain set to: %.1f", param.as_double());
+          } else {
+            result.successful = false;
+            result.reason = "Failed to set gain, status = " + std::to_string(status);
+          }
+        }
+      } else if (param.get_name() == "frame_rate") {
+        int status = MV_CC_SetFloatValue(camera_handle_, "AcquisitionFrameRate", param.as_double());
+        if (MV_OK == status) {
+          RCLCPP_INFO(this->get_logger(), "Frame rate set to: %.1f", param.as_double());
         } else {
-            RCLCPP_WARN_ONCE(this->get_logger(), 
-                           "Unsupported pixel format: 0x%lx", frame_info.enPixelType);
-            return;
+          result.successful = false;
+          result.reason = "Failed to set frame rate, status = " + std::to_string(status);
         }
-        
-        image_msg->encoding = encoding;
-        
-        // 拷贝图像数据
-        memcpy(image_msg->data.data(), image_buffer_.get(), frame_info.nFrameLen);
-        
-        // 获取相机信息
-        *camera_info_msg = camera_info_manager_->getCameraInfo();
-        camera_info_msg->header = image_msg->header;
-        
-        // 发布图像（带相机信息）
-        camera_publisher_.publish(std::move(image_msg), std::move(camera_info_msg));
-    }
-
-    void attempt_reconnection()
-    {
-        cleanup();
-        if (connect_camera() && configure_camera_parameters() && start_grabbing()) {
-            RCLCPP_INFO(this->get_logger(), "Camera reconnected successfully");
+      } else if (param.get_name() == "auto_exposure") {
+        int status = MV_CC_SetEnumValue(camera_handle_, "ExposureAuto", param.as_bool() ? 1 : 0);
+        if (MV_OK == status) {
+          RCLCPP_INFO(this->get_logger(), "Auto exposure %s", param.as_bool() ? "enabled" : "disabled");
         } else {
-            RCLCPP_ERROR(this->get_logger(), "Camera reconnection failed");
+          result.successful = false;
+          result.reason = "Failed to set auto exposure, status = " + std::to_string(status);
         }
-    }
-
-    void handle_camera_error()
-    {
-        RCLCPP_ERROR(this->get_logger(), "Camera error detected, disconnecting...");
-        is_connected_ = false;
-        is_grabbing_ = false;
-    }
-
-    bool allocate_image_buffer()
-    {
-        MVCC_INTVALUE_EX payload_size;
-        memset(&payload_size, 0, sizeof(MVCC_INTVALUE_EX));
-        
-        int ret = MV_CC_GetIntValueEx(camera_handle_, "PayloadSize", &payload_size);
-        if (ret == MV_OK) {
-            buffer_size_ = payload_size.nCurValue;
-            image_buffer_ = std::make_unique<unsigned char[]>(buffer_size_);
-            RCLCPP_INFO(this->get_logger(), "Image buffer allocated: %u bytes", buffer_size_);
-            return true;
+      } else if (param.get_name() == "auto_gain") {
+        int status = MV_CC_SetEnumValue(camera_handle_, "GainAuto", param.as_bool() ? 1 : 0);
+        if (MV_OK == status) {
+          RCLCPP_INFO(this->get_logger(), "Auto gain %s", param.as_bool() ? "enabled" : "disabled");
         } else {
-            RCLCPP_ERROR(this->get_logger(), "Failed to get payload size: 0x%x", ret);
-            return false;
+          result.successful = false;
+          result.reason = "Failed to set auto gain, status = " + std::to_string(status);
         }
+      } else {
+        RCLCPP_WARN(this->get_logger(), "Unknown parameter: %s", param.get_name().c_str());
+      }
     }
 
-    unsigned int pixel_format_string_to_enum(const std::string& format_str)
-    {
-        if (format_str == "mono8") return PixelType_Gvsp_Mono8;
-        if (format_str == "bgr8") return PixelType_Gvsp_BGR8_Packed;
-        if (format_str == "rgb8") return PixelType_Gvsp_RGB8_Packed;
-        
-        RCLCPP_ERROR(this->get_logger(), "Unsupported pixel format: %s", format_str.c_str());
-        return 0;
-    }
+    return result;
+  }
 
-    bool set_resolution(int64_t width, int64_t height)
-    {
-        stop_grabbing();
-        
-        bool success = true;
-        int ret = MV_CC_SetIntValueEx(camera_handle_, "Width", width);
-        if (ret != MV_OK) {
-            RCLCPP_ERROR(this->get_logger(), "Failed to set width: 0x%x", ret);
-            success = false;
-        }
-        
-        ret = MV_CC_SetIntValueEx(camera_handle_, "Height", height);
-        if (ret != MV_OK) {
-            RCLCPP_ERROR(this->get_logger(), "Failed to set height: 0x%x", ret);
-            success = false;
-        }
-        
-        if (success) {
-            if (!allocate_image_buffer()) {
-                success = false;
-            } else {
-                RCLCPP_INFO(this->get_logger(), "Resolution changed to %ldx%ld", width, height);
-            }
-        }
-        
-        start_grabbing();
-        return success;
-    }
-
-    bool set_pixel_format(const std::string& format_str)
-    {
-        stop_grabbing();
-        
-        unsigned int pixel_format = pixel_format_string_to_enum(format_str);
-        if (pixel_format == 0) {
-            start_grabbing();
-            return false;
-        }
-        
-        int ret = MV_CC_SetEnumValue(camera_handle_, "PixelFormat", pixel_format);
-        if (ret != MV_OK) {
-            RCLCPP_ERROR(this->get_logger(), "Failed to set pixel format: 0x%x", ret);
-            start_grabbing();
-            return false;
-        }
-        
-        start_grabbing();
-        RCLCPP_INFO(this->get_logger(), "Pixel format changed to %s", format_str.c_str());
-        return true;
-    }
-
-    rcl_interfaces::msg::SetParametersResult on_parameters_changed(
-        const std::vector<rclcpp::Parameter>& parameters)
-    {
-        rcl_interfaces::msg::SetParametersResult result;
-        result.successful = true;
-        result.reason = "success";
-
-        bool resolution_changed = false;
-        bool pixel_format_changed = false;
-        int64_t new_width = current_params_.width;
-        int64_t new_height = current_params_.height;
-
-        for (const auto& param : parameters) {
-            const std::string& name = param.get_name();
-            
-            if (name == "exposure_time") {
-                int ret = MV_CC_SetFloatValue(camera_handle_, "ExposureTime", param.as_double());
-                if (ret != MV_OK) {
-                    result.successful = false;
-                    result.reason = "Failed to set exposure time";
-                } else {
-                    current_params_.exposure_time = param.as_double();
-                }
-            }
-            else if (name == "gain") {
-                int ret = MV_CC_SetFloatValue(camera_handle_, "Gain", param.as_double());
-                if (ret != MV_OK) {
-                    result.successful = false;
-                    result.reason = "Failed to set gain";
-                } else {
-                    current_params_.gain = param.as_double();
-                }
-            }
-            else if (name == "frame_rate") {
-                int ret = MV_CC_SetFloatValue(camera_handle_, "AcquisitionFrameRate", param.as_double());
-                if (ret != MV_OK) {
-                    result.successful = false;
-                    result.reason = "Failed to set frame rate";
-                } else {
-                    current_params_.frame_rate = param.as_double();
-                    setup_timer(); // 重新设置定时器
-                }
-            }
-            else if (name == "pixel_format") {
-                pixel_format_changed = true;
-                current_params_.pixel_format = param.as_string();
-            }
-            else if (name == "width") {
-                resolution_changed = true;
-                new_width = param.as_int();
-                current_params_.width = new_width;
-            }
-            else if (name == "height") {
-                resolution_changed = true;
-                new_height = param.as_int();
-                current_params_.height = new_height;
-            }
-            else if (name == "camera_name") {
-                current_params_.camera_name = param.as_string();
-                RCLCPP_INFO(this->get_logger(), "Camera name changed to: %s", 
-                           current_params_.camera_name.c_str());
-            }
-            else if (name == "camera_frame_id") {
-                current_params_.camera_frame_id = param.as_string();
-                RCLCPP_INFO(this->get_logger(), "Camera frame ID changed to: %s", 
-                           current_params_.camera_frame_id.c_str());
-            }
-        }
-
-        // 处理需要重启采集的参数
-        if (resolution_changed) {
-            if (!set_resolution(new_width, new_height)) {
-                result.successful = false;
-                result.reason = "Failed to set resolution";
-            }
-        }
-        
-        if (pixel_format_changed) {
-            if (!set_pixel_format(current_params_.pixel_format)) {
-                result.successful = false;
-                result.reason = "Failed to set pixel format";
-            }
-        }
-
-        return result;
-    }
-
-    void log_camera_error(int error_code, const std::string& operation)
-    {
-        if (error_code != MV_OK) {
-            RCLCPP_ERROR(this->get_logger(), "%s failed: 0x%x", operation.c_str(), error_code);
-        }
-    }
-
-    void cleanup()
-    {
-        stop_grabbing();
-        
-        if (camera_handle_) {
-            if (is_connected_) {
-                MV_CC_CloseDevice(camera_handle_);
-            }
-            MV_CC_DestroyHandle(camera_handle_);
-            camera_handle_ = nullptr;
-        }
-        
-        is_connected_ = false;
-        is_grabbing_ = false;
-        image_buffer_.reset();
-        buffer_size_ = 0;
-        
-        RCLCPP_INFO(this->get_logger(), "Camera resources cleaned up");
-    }
+  // 成员变量
+  void * camera_handle_ = nullptr;
+  std::atomic<bool> running_{true};
+  std::atomic<bool> camera_connected_{false};
+  
+  std::thread camera_manager_thread_;
+  std::thread capture_thread_;
+  
+  image_transport::CameraPublisher camera_pub_;
+  std::unique_ptr<camera_info_manager::CameraInfoManager> camera_info_manager_;
+  
+  OnSetParametersCallbackHandle::SharedPtr params_callback_handle_;
 };
 
-int main(int argc, char* argv[])
-{
-    rclcpp::init(argc, argv);
-    
-    try {
-        auto node = std::make_shared<HikCameraNode>();
-        rclcpp::spin(node);
-    }
-    catch (const std::exception& e) {
-        RCLCPP_FATAL(rclcpp::get_logger("main"), "Exception: %s", e.what());
-        return 1;
-    }
-    
-    rclcpp::shutdown();
-    return 0;
-}
+}  // namespace hik_camera
+
+#include "rclcpp_components/register_node_macro.hpp"
+
+RCLCPP_COMPONENTS_REGISTER_NODE(hik_camera::HikCameraNode)
