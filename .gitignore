@@ -1,4 +1,7 @@
 XJTU-RMV-Task01/build
 build
+install
+log
 .vscode
 .cache
+.clangd
