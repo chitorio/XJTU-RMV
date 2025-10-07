@@ -28,10 +28,11 @@ def generate_launch_description():
             default_value='false'
         ),
 
+        # 启动相机节点
         Node(
-            package='task',                         # 包名
-            executable='task_node',                 # 可执行文件名（从 CMakeLists 来的）
-            name='camera_node',                 # 节点名称
+            package='task',
+            executable='task_node',
+            name='camera_node',
             output='screen',
             emulate_tty=True,
             parameters=[
@@ -40,5 +41,14 @@ def generate_launch_description():
                     'camera_info_url': LaunchConfiguration('camera_info_url')
                 },
             ],
+        ),
+
+        # 启动 RViz2
+        Node(
+            package='rviz2',
+            executable='rviz2',
+            name='rviz2',
+            output='screen',
+            arguments=[]
         )
     ])

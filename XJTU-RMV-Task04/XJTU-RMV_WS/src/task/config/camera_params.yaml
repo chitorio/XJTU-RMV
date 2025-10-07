@@ -5,10 +5,10 @@
     camera_ip: ""             # 仅GigE相机使用，USB可留空
 
     # 基本采集参数
-    exposure_time: 8000.0    # 微秒，亮度不足时可适当加大 (范围 100-1000000)
+    exposure_time: 5000.0    # 微秒，亮度不足时可适当加大 (范围 100-1000000)
     gain: 10.0                # dB，调大画面更亮但噪声增加
     frame_rate: 160.0          # 帧率 Hz
-    pixel_format: "bgr8"      # 可选: "BGR8" 或 "Mono8"
+    pixel_format: "Bayer_RG_8"      # 可选: "BGR8" 或 "Mono8"
 
     # 分辨率设置（需符合相机支持的值）
     width: 640

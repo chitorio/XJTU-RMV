@@ -294,6 +294,24 @@ private:
     }
 
     RCLCPP_INFO(this->get_logger(), "Camera configured successfully");
+
+    // 新增：读取实际帧率
+    MVCC_FLOATVALUE frame_rate_value;
+    ret = MV_CC_GetFloatValue(camera_handle_, "ResultingFrameRate", &frame_rate_value);
+    if (ret == MV_OK) {
+        RCLCPP_INFO(this->get_logger(), "Actual frame rate: %.1f Hz (Min: %.1f, Max: %.1f)", 
+                    frame_rate_value.fCurValue, frame_rate_value.fMin, frame_rate_value.fMax);
+    } else {
+        // 如果ResultingFrameRate不存在，尝试读取设置的帧率
+        ret = MV_CC_GetFloatValue(camera_handle_, "AcquisitionFrameRate", &frame_rate_value);
+        if (ret == MV_OK) {
+            RCLCPP_INFO(this->get_logger(), "Set frame rate: %.1f Hz (Min: %.1f, Max: %.1f)", 
+                        frame_rate_value.fCurValue, frame_rate_value.fMin, frame_rate_value.fMax);
+        } else {
+            RCLCPP_WARN(this->get_logger(), "Failed to read frame rate! ret[0x%x]", ret);
+        }
+    }
+
     return true;
   }
 
@@ -364,10 +382,15 @@ private:
   }
 
   void captureImages()
-  {
+    {
     MV_FRAME_OUT out_frame;
     int fail_count = 0;
     const int max_fail_count = 5;
+
+    // 新增：帧率统计相关变量
+    auto last_stat_time = std::chrono::steady_clock::now();
+    int frame_count = 0;
+    const int stat_interval_frames = 100; // 每100帧统计一次
 
     RCLCPP_INFO(this->get_logger(), "Starting image capture thread");
 
@@ -381,9 +404,9 @@ private:
     memset(&convert_param, 0, sizeof(MV_CC_PIXEL_CONVERT_PARAM));
 
     while (rclcpp::ok() && running_ && camera_connected_) {
-      int ret = MV_CC_GetImageBuffer(camera_handle_, &out_frame, 1000);
-      
-      if (MV_OK == ret) {
+        int ret = MV_CC_GetImageBuffer(camera_handle_, &out_frame, 1000);
+        
+        if (MV_OK == ret) {
         // 配置转换参数
         convert_param.nWidth = out_frame.stFrameInfo.nWidth;
         convert_param.nHeight = out_frame.stFrameInfo.nHeight;
@@ -402,7 +425,7 @@ private:
         // 调整数据缓冲区大小
         size_t required_size = image_msg.step * image_msg.height;
         if (image_msg.data.size() != required_size) {
-          image_msg.data.resize(required_size);
+            image_msg.data.resize(required_size);
         }
 
         convert_param.pDstBuffer = image_msg.data.data();
@@ -411,32 +434,51 @@ private:
         // 转换像素格式
         int convert_ret = MV_CC_ConvertPixelType(camera_handle_, &convert_param);
         if (convert_ret == MV_OK) {
-          // 发布图像
-          auto camera_info_msg = camera_info_manager_->getCameraInfo();
-          camera_info_msg.header = image_msg.header;
-          camera_pub_.publish(image_msg, camera_info_msg);
-          
-          fail_count = 0;
+            // 发布图像
+            auto camera_info_msg = camera_info_manager_->getCameraInfo();
+            camera_info_msg.header = image_msg.header;
+            camera_pub_.publish(image_msg, camera_info_msg);
+            
+            // 新增：帧率统计
+            frame_count++;
+            
+            // 每100帧输出一次帧率统计
+            if (frame_count >= stat_interval_frames) {
+            auto current_time = std::chrono::steady_clock::now();
+            auto elapsed_time = std::chrono::duration_cast<std::chrono::milliseconds>(
+                current_time - last_stat_time).count();
+            
+            double actual_fps = (frame_count * 1000.0) / elapsed_time;
+            
+            RCLCPP_INFO(this->get_logger(), "Current frame rate: %.1f Hz (frames: %d, elapsed: %ld ms)", 
+                        actual_fps, frame_count, elapsed_time);
+            
+            // 重置统计
+            frame_count = 0;
+            last_stat_time = current_time;
+            }
+            
+            fail_count = 0;
         } else {
-          RCLCPP_WARN(this->get_logger(), "Pixel conversion failed! ret[0x%x]", convert_ret);
+            RCLCPP_WARN(this->get_logger(), "Pixel conversion failed! ret[0x%x]", convert_ret);
         }
 
         MV_CC_FreeImageBuffer(camera_handle_, &out_frame);
-      } else {
+        } else {
         RCLCPP_WARN(this->get_logger(), "Get image buffer failed! ret[0x%x]", ret);
         fail_count++;
         
         if (fail_count >= max_fail_count) {
-          RCLCPP_ERROR(this->get_logger(), "Too many consecutive failures, disconnecting camera");
-          camera_connected_ = false;
-          closeCamera();
-          break;
+            RCLCPP_ERROR(this->get_logger(), "Too many consecutive failures, disconnecting camera");
+            camera_connected_ = false;
+            closeCamera();
+            break;
         }
-      }
+        }
     }
     
     RCLCPP_INFO(this->get_logger(), "Image capture thread exiting");
-  }
+    }
 
   rcl_interfaces::msg::SetParametersResult parametersCallback(
     const std::vector<rclcpp::Parameter> & parameters)
@@ -477,6 +519,13 @@ private:
         int status = MV_CC_SetFloatValue(camera_handle_, "AcquisitionFrameRate", param.as_double());
         if (MV_OK == status) {
           RCLCPP_INFO(this->get_logger(), "Frame rate set to: %.1f", param.as_double());
+
+          // 新增：读取实际帧率
+            MVCC_FLOATVALUE frame_rate_value;
+            int read_status = MV_CC_GetFloatValue(camera_handle_, "ResultingFrameRate", &frame_rate_value);
+            if (read_status == MV_OK) {
+                RCLCPP_INFO(this->get_logger(), "Actual frame rate: %.1f Hz", frame_rate_value.fCurValue);
+            }
         } else {
           result.successful = false;
           result.reason = "Failed to set frame rate, status = " + std::to_string(status);
