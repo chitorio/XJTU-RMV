@@ -1,0 +1,10 @@
+/**:
+  ros__parameters:
+    camera_sn: ""               # 可选：指定相机序列号（空表示自动连接）
+    camera_ip: ""               # 可选：指定相机IP
+    exposure_time: 20000.0      # 微秒，典型范围 100 - 100000
+    gain: 10.0                  # dB
+    frame_rate: 180.0            # 帧率 Hz
+    pixel_format: "RGB8"        # 可选值: "RGB8", "BGR8", "Mono8"
+    image_topic: "/image_raw"   # 发布的话题名
+    use_sensor_data_qos: false  # 是否使用 sensor_data QoS（用于图像话题）

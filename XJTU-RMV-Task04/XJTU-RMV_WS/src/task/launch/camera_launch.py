@@ -31,7 +31,7 @@ def generate_launch_description():
         Node(
             package='task',                         # 包名
             executable='task_node',                 # 可执行文件名（从 CMakeLists 来的）
-            name='hik_camera_node',                 # 节点名称
+            name='camera_node',                 # 节点名称
             output='screen',
             emulate_tty=True,
             parameters=[
