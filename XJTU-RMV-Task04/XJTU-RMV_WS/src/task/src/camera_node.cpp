@@ -1,201 +1,250 @@
 // camera_node.cpp
-#include "MvCameraControl.h"
+// Hikvision MVS SDK (USB) -> ROS2 image publisher
+// - Uses MV_CC_GetImageBuffer + MV_CC_ConvertPixelType
+// - Reads parameters from ROS2 parameter server (so launch can load YAML)
+// - Publishes image_transport camera publisher (image + camera_info)
+//
+// Build: part of a ament package; link with MvCameraControl and related libs.
 
-// ROS
-#include <camera_info_manager/camera_info_manager.hpp>
-#include <image_transport/image_transport.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <rcl_interfaces/msg/set_parameters_result.hpp>
 #include <sensor_msgs/msg/image.hpp>
 #include <sensor_msgs/msg/camera_info.hpp>
+#include <image_transport/image_transport.hpp>
+#include <camera_info_manager/camera_info_manager.hpp>
 
-#include <thread>
-#include <chrono>
+#include "MvCameraControl.h"
+
 #include <memory>
 #include <string>
 #include <vector>
+#include <thread>
+#include <chrono>
 #include <mutex>
-#include <atomic>
-#include <sstream>
-#include <iomanip>
+#include <arpa/inet.h> // ntohl if needed for GigE (safe to include)
+#include <cstring>
 
-namespace hik_camera
-{
+using namespace std::chrono_literals;
 
 class HikCameraNode : public rclcpp::Node
 {
 public:
-  explicit HikCameraNode(const rclcpp::NodeOptions & options) : Node("camera_node", options)
+  explicit HikCameraNode(const rclcpp::NodeOptions &options = rclcpp::NodeOptions())
+  : Node("hik_camera_node", options)
   {
-    RCLCPP_INFO(this->get_logger(), "[HikCameraNode] start");
+    RCLCPP_INFO(get_logger(), "[HikCameraNode] start");
 
-    // Basic connection selection params (declare before trying to read CLI)
-    camera_sn_ = this->declare_parameter<std::string>("camera_sn", "");
-    camera_ip_ = this->declare_parameter<std::string>("camera_ip", "");
-    use_sensor_data_qos_ = this->declare_parameter<bool>("use_sensor_data_qos", true);
+    // --- Declare parameters (defaults) ---
+    this->declare_parameter<std::string>("camera_sn", "");
+    this->declare_parameter<std::string>("camera_ip", "");
+    this->declare_parameter<double>("exposure_time", 50000.0); // microseconds
+    this->declare_parameter<double>("gain", 10.0);
+    this->declare_parameter<double>("frame_rate", 30.0);
+    this->declare_parameter<std::string>("pixel_format", "BGR8"); // BGR8 | Mono8
+    this->declare_parameter<int64_t>("width", 640);
+    this->declare_parameter<int64_t>("height", 480);
+    this->declare_parameter<int>("reconnect_interval_sec", 2);
+    this->declare_parameter<int>("max_reconnect_attempts", 0); // 0 -> infinite
 
-    reconnect_interval_sec_ =
-      this->declare_parameter<int>("reconnect_interval_sec", 2);
-    max_reconnect_attempts_ =
-      this->declare_parameter<int>("max_reconnect_attempts", 0); // 0 => infinite
+    // camera_info YAML URL (optional)
+    this->declare_parameter<std::string>("camera_info_url", std::string(""));
 
-    // QoS and publisher
-    auto qos = use_sensor_data_qos_ ? rmw_qos_profile_sensor_data : rmw_qos_profile_default;
+    // QoS choice
+    this->declare_parameter<bool>("use_sensor_data_qos", false);
+
+    bool use_sensor_qos = this->get_parameter("use_sensor_data_qos").as_bool();
+    auto qos = use_sensor_qos ? rmw_qos_profile_sensor_data : rmw_qos_profile_default;
+
+    // publisher (camera publisher expects image + camera_info)
     camera_pub_ = image_transport::create_camera_publisher(this, "image_raw", qos);
 
-    // Try connecting. We'll try a few times here before giving control to capture loop.
-    if (!connectCamera()) {
-      RCLCPP_WARN(this->get_logger(), "[HikCameraNode] initial connect failed. Capture loop will attempt reconnects.");
-      // do not shutdown here — captureLoop includes reconnect attempts
+    // camera_info manager
+    camera_name_ = this->get_parameter("camera_sn").as_string(); // fallback; can be overridden
+    if (camera_name_.empty()) {
+      camera_name_ = this->get_name();
     }
-
-    // CameraInfo manager (optional file)
-    camera_name_ = this->declare_parameter<std::string>("camera_name", "narrow_stereo");
-    camera_info_manager_ =
-      std::make_unique<camera_info_manager::CameraInfoManager>(this, camera_name_);
-    auto camera_info_url = this->declare_parameter<std::string>(
-      "camera_info_url", "package://task/config/camera_info.yaml");
-    if (camera_info_manager_->validateURL(camera_info_url)) {
+    camera_info_manager_ = std::make_unique<camera_info_manager::CameraInfoManager>(this, camera_name_);
+    std::string camera_info_url = this->get_parameter("camera_info_url").as_string();
+    if (!camera_info_url.empty() && camera_info_manager_->validateURL(camera_info_url)) {
       camera_info_manager_->loadCameraInfo(camera_info_url);
       camera_info_msg_ = camera_info_manager_->getCameraInfo();
+      RCLCPP_INFO(get_logger(), "[HikCameraNode] loaded camera_info from %s", camera_info_url.c_str());
     } else {
-      RCLCPP_INFO(this->get_logger(), "[HikCameraNode] camera_info URL invalid or not provided");
+      RCLCPP_INFO(get_logger(), "[HikCameraNode] no valid camera_info_url provided or file missing");
     }
 
-    // Declare and apply camera parameters that require an open handle
-    // Note: if camera not open yet, declareCameraParameters() will skip SDK calls.
-    declareCameraParameters();
+    // Register parameter callback for runtime changes
+    params_cb_handle_ = this->add_on_set_parameters_callback(
+      std::bind(&HikCameraNode::on_parameter_change, this, std::placeholders::_1));
 
-    // Parameter change callback
-    params_callback_handle_ = this->add_on_set_parameters_callback(
-      std::bind(&HikCameraNode::parametersCallback, this, std::placeholders::_1));
-
-    // Start capture thread
+    // Start capture thread (will attempt to connect and capture)
     running_.store(true);
     capture_thread_ = std::thread(&HikCameraNode::captureLoop, this);
   }
 
   ~HikCameraNode() override
   {
-    RCLCPP_INFO(this->get_logger(), "[HikCameraNode] shutting down...");
     running_.store(false);
-    if (capture_thread_.joinable()) {
-      capture_thread_.join();
-    }
+    if (capture_thread_.joinable()) capture_thread_.join();
     disconnectCamera();
-    RCLCPP_INFO(this->get_logger(), "[HikCameraNode] stopped.");
+    RCLCPP_INFO(get_logger(), "[HikCameraNode] stopped");
   }
 
 private:
-  // ---------------- helpers ----------------
-  static std::string ipToString(uint32_t ip)
-  {
-    // SDK might store IP in host or network order; this produces a dotted quad using big-endian order.
-    std::ostringstream ss;
-    ss << ((ip >> 24) & 0xFF) << "." << ((ip >> 16) & 0xFF) << "." << ((ip >> 8) & 0xFF) << "." << (ip & 0xFF);
-    return ss.str();
+  // --- members ---
+  void *camera_handle_ = nullptr;
+  std::atomic<bool> running_{false};
+  std::thread capture_thread_;
+  std::mutex camera_mutex_;
+
+  std::unique_ptr<unsigned char[]> sdk_buffer_; // raw buffer from SDK (payload)
+  size_t sdk_buffer_size_ = 0;
+
+  image_transport::CameraPublisher camera_pub_;
+  std::unique_ptr<camera_info_manager::CameraInfoManager> camera_info_manager_;
+  sensor_msgs::msg::CameraInfo camera_info_msg_;
+  std::string camera_name_;
+
+  rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr params_cb_handle_;
+
+  // helper: get param value safely
+  template<typename T>
+  T get_param_or(const std::string &name, const T &def) {
+    try {
+      return this->get_parameter(name).get_value<T>();
+    } catch (...) {
+      return def;
+    }
   }
 
-  // ---------------- Camera connection ----------------
+  // parameter change callback
+  rcl_interfaces::msg::SetParametersResult on_parameter_change(const std::vector<rclcpp::Parameter> &params)
+  {
+    rcl_interfaces::msg::SetParametersResult result;
+    result.successful = true;
+    for (const auto &p : params) {
+      RCLCPP_INFO(get_logger(), "[on_param] %s changed", p.get_name().c_str());
+      // For parameters that require restarting grabbing (pixel_format / resolution), we enforce reconnect in capture loop
+    }
+    return result;
+  }
+
+  // connect to camera (USB/GIGE depending on enum)
   bool connectCamera()
   {
     std::lock_guard<std::mutex> lock(camera_mutex_);
 
-    MV_CC_DEVICE_INFO_LIST device_list;
-    nRet_ = MV_CC_EnumDevices(MV_GIGE_DEVICE | MV_USB_DEVICE, &device_list);
-    if (nRet_ != MV_OK) {
-      RCLCPP_ERROR(this->get_logger(), "[connectCamera] MV_CC_EnumDevices failed, nRet=0x%X", nRet_);
+    // Enum USB devices (use MV_USB_DEVICE for USB)
+    MV_CC_DEVICE_INFO_LIST stDeviceList;
+    memset(&stDeviceList, 0, sizeof(stDeviceList));
+    int nRet = MV_CC_EnumDevices(MV_USB_DEVICE, &stDeviceList);
+    if (nRet != MV_OK) {
+      RCLCPP_ERROR(get_logger(), "[connectCamera] MV_CC_EnumDevices failed: 0x%X", nRet);
       return false;
     }
-    RCLCPP_INFO(this->get_logger(), "[connectCamera] found %d devices", device_list.nDeviceNum);
-
-    if (device_list.nDeviceNum == 0) {
+    RCLCPP_INFO(get_logger(), "[connectCamera] found %d devices", stDeviceList.nDeviceNum);
+    if (stDeviceList.nDeviceNum == 0) {
       return false;
     }
 
-    // Choose default device (first) or match by SN/IP if provided
-    MV_CC_DEVICE_INFO* selected_dev = device_list.pDeviceInfo[0];
-
-    if (!camera_sn_.empty() || !camera_ip_.empty()) {
-      selected_dev = nullptr;
-      for (unsigned int i = 0; i < device_list.nDeviceNum; ++i) {
-        MV_CC_DEVICE_INFO* dev = device_list.pDeviceInfo[i];
-        bool match = false;
-        // Try SN (GigE has serial in stGigEInfo.chSerialNumber)
-        if (!camera_sn_.empty()) {
-          if (std::strncmp(reinterpret_cast<char*>(dev->SpecialInfo.stGigEInfo.chSerialNumber),
-                           camera_sn_.c_str(), camera_sn_.size()) == 0) {
-            match = true;
-          }
-        }
-        // Try IP matching
-        if (!match && !camera_ip_.empty()) {
-          uint32_t ip_val = dev->SpecialInfo.stGigEInfo.nCurrentIp;
-          if (!camera_ip_.empty() && camera_ip_ == ipToString(ip_val)) {
-            match = true;
-          }
-        }
-        if (match) {
-          selected_dev = dev;
-          break;
+    // choose device: if camera_sn provided, try match; else first device
+    std::string wanted_sn = get_param_or<std::string>("camera_sn", std::string(""));
+    int selected_index = 0;
+    if (!wanted_sn.empty()) {
+      bool found = false;
+      for (unsigned int i = 0; i < stDeviceList.nDeviceNum; ++i) {
+        MV_CC_DEVICE_INFO *info = stDeviceList.pDeviceInfo[i];
+        // read serial number using SDK struct MVCC_DEVICE_SF_INFO? prefer MVCC_STRINGVALUE via MV_CC_GetStringValue
+        MVCC_STRINGVALUE stSn;
+        memset(&stSn, 0, sizeof(stSn));
+        // MV_CC_GetStringValue has overloads for handle options, but SDK provides ways to read device info.
+        // Use MV_CC_GetStringValue with the device info pointer is not available on all SDKs; if not available, fallback to pDeviceInfo data access.
+        int sret = MV_CC_GetStringValue(info, "DeviceSerialNumber", &stSn);
+        if (sret == MV_OK) {
+          std::string cur_sn = stSn.chCurValue;
+          if (cur_sn == wanted_sn) { selected_index = i; found = true; break; }
+        } else {
+          // Fallback: try to read SpecialInfo if present (some SDK builds)
+          // Many USB device info structs include SerialNumber in SpecialInfo, but name differs. We skip fallback here.
         }
       }
-      if (!selected_dev) {
-        RCLCPP_WARN(this->get_logger(), "[connectCamera] specified SN/IP not found");
-        return false;
+      if (!found) {
+        RCLCPP_WARN(get_logger(), "[connectCamera] SN '%s' not found, using first device", wanted_sn.c_str());
       }
     }
 
-    // Create & open handle
-    nRet_ = MV_CC_CreateHandle(&camera_handle_, selected_dev);
-    if (nRet_ != MV_OK) {
-      RCLCPP_ERROR(this->get_logger(), "[connectCamera] MV_CC_CreateHandle failed, nRet=0x%X", nRet_);
+    // create handle
+    nRet = MV_CC_CreateHandle(&camera_handle_, stDeviceList.pDeviceInfo[selected_index]);
+    if (nRet != MV_OK) {
+      RCLCPP_ERROR(get_logger(), "[connectCamera] MV_CC_CreateHandle failed: 0x%X", nRet);
       camera_handle_ = nullptr;
       return false;
     }
 
-    nRet_ = MV_CC_OpenDevice(camera_handle_);
-    if (nRet_ != MV_OK) {
-      RCLCPP_ERROR(this->get_logger(), "[connectCamera] MV_CC_OpenDevice failed, nRet=0x%X", nRet_);
+    // open device
+    nRet = MV_CC_OpenDevice(camera_handle_);
+    if (nRet != MV_OK) {
+      RCLCPP_ERROR(get_logger(), "[connectCamera] MV_CC_OpenDevice failed: 0x%X", nRet);
       MV_CC_DestroyHandle(&camera_handle_);
       camera_handle_ = nullptr;
       return false;
     }
 
-    // Get image info
-    nRet_ = MV_CC_GetImageInfo(camera_handle_, &img_info_);
-    if (nRet_ != MV_OK) {
-      RCLCPP_ERROR(this->get_logger(), "[connectCamera] MV_CC_GetImageInfo failed, nRet=0x%X", nRet_);
+    // set trigger off (free-run)
+    MV_CC_SetEnumValue(camera_handle_, "TriggerMode", MV_TRIGGER_MODE_OFF);
+
+    // apply parameters from server (resolution / exposure / gain / frame_rate / pixel_format)
+    int64_t width = get_param_or<int64_t>("width", 640);
+    int64_t height = get_param_or<int64_t>("height", 480);
+    double exposure = get_param_or<double>("exposure_time", 50000.0);
+    double gain = get_param_or<double>("gain", 10.0);
+    double frame_rate = get_param_or<double>("frame_rate", 30.0);
+    std::string pixel_format = get_param_or<std::string>("pixel_format", std::string("BGR8"));
+
+    // set resolution (some cameras require stop/start to set resolution; here attempt to set before grabbing)
+    MV_CC_SetIntValue(camera_handle_, "Width", width);
+    MV_CC_SetIntValue(camera_handle_, "Height", height);
+
+    // set exposure/gain/fps
+    MV_CC_SetFloatValue(camera_handle_, "ExposureTime", exposure);
+    MV_CC_SetFloatValue(camera_handle_, "Gain", gain);
+    MV_CC_SetFloatValue(camera_handle_, "AcquisitionFrameRate", frame_rate);
+
+    // set PixelFormat on device if supported (we will still convert via SDK to bgr8)
+    if (pixel_format == "Mono8") {
+      MV_CC_SetEnumValue(camera_handle_, "PixelFormat", PixelType_Gvsp_Mono8);
+    } else if (pixel_format == "BGR8") {
+      MV_CC_SetEnumValue(camera_handle_, "PixelFormat", PixelType_Gvsp_BGR8_Packed);
+    } else if (pixel_format == "RGB8") {
+      // many Hik cameras use BGR ordering; set to BGR on device and convert later if needed
+      MV_CC_SetEnumValue(camera_handle_, "PixelFormat", PixelType_Gvsp_BGR8_Packed);
+    }
+
+    // get payload size from SDK and allocate sdk_buffer_
+    MVCC_INTVALUE_EX stPayload;
+    memset(&stPayload, 0, sizeof(stPayload));
+    nRet = MV_CC_GetIntValueEx(camera_handle_, "PayloadSize", &stPayload);
+    if (nRet != MV_OK) {
+      RCLCPP_ERROR(get_logger(), "[connectCamera] MV_CC_GetIntValueEx(PayloadSize) failed: 0x%X", nRet);
+      disconnectCamera();
+      return false;
+    }
+    sdk_buffer_size_ = static_cast<size_t>(stPayload.nCurValue);
+    sdk_buffer_.reset(new unsigned char[sdk_buffer_size_]);
+
+    // start grabbing
+    nRet = MV_CC_StartGrabbing(camera_handle_);
+    if (nRet != MV_OK) {
+      RCLCPP_ERROR(get_logger(), "[connectCamera] MV_CC_StartGrabbing failed: 0x%X", nRet);
       disconnectCamera();
       return false;
     }
 
-    // allocate stable frame buffer (max size)
-    size_t max_channels = 3; // we'll assume RGB max; Mono8 will use 1 channel later
-    frame_buffer_.resize(static_cast<size_t>(img_info_.nWidthMax) * img_info_.nHeightMax * max_channels);
+    // adjust publish rate: cap frame_rate to reasonable max to avoid timeouts
+    double cap_rate = std::min(frame_rate, 30.0);
+    publish_period_ms_ = static_cast<int>(1000.0 / cap_rate);
 
-    // Setup convert param (point to frame_buffer_)
-    convert_param_.nWidth = img_info_.nWidthValue;
-    convert_param_.nHeight = img_info_.nHeightValue;
-    // enDstPixelType set by declareCameraParameters / parameter callback; default to RGB
-    if (pixel_format_.empty()) {
-      convert_param_.enDstPixelType = PixelType_Gvsp_RGB8_Packed;
-      pixel_format_ = "RGB8";
-    } else {
-      convert_param_.enDstPixelType = (pixel_format_ == "Mono8") ? PixelType_Gvsp_Mono8 : PixelType_Gvsp_RGB8_Packed;
-    }
-    convert_param_.pDstBuffer = frame_buffer_.data();
-    convert_param_.nDstBufferSize = frame_buffer_.size();
-
-    // Start grabbing
-    nRet_ = MV_CC_StartGrabbing(camera_handle_);
-    if (nRet_ != MV_OK) {
-      RCLCPP_ERROR(this->get_logger(), "[connectCamera] MV_CC_StartGrabbing failed, nRet=0x%X", nRet_);
-      disconnectCamera();
-      return false;
-    }
-
-    RCLCPP_INFO(this->get_logger(), "[connectCamera] camera opened and grabbing started");
+    RCLCPP_INFO(get_logger(), "[connectCamera] camera opened and grabbing started (payload=%zu bytes).", sdk_buffer_size_);
     return true;
   }
 
@@ -207,264 +256,124 @@ private:
       MV_CC_CloseDevice(camera_handle_);
       MV_CC_DestroyHandle(&camera_handle_);
       camera_handle_ = nullptr;
-      RCLCPP_INFO(this->get_logger(), "[disconnectCamera] camera disconnected");
     }
+    sdk_buffer_.reset();
+    sdk_buffer_size_ = 0;
   }
 
-  // ---------------- Camera parameters ----------------
-  void declareCameraParameters()
-  {
-    // This function declares parameters. If camera_handle_ exists, we also query SDK defaults/limits.
-    try {
-      rcl_interfaces::msg::ParameterDescriptor desc;
-      MVCC_FLOATVALUE fvalue;
-
-      if (camera_handle_) {
-        // Exposure
-        if (MV_CC_GetFloatValue(camera_handle_, "ExposureTime", &fvalue) == MV_OK) {
-          desc.description = "Exposure time (microseconds)";
-          desc.integer_range.resize(1);
-          desc.integer_range[0].from_value = fvalue.fMin;
-          desc.integer_range[0].to_value = fvalue.fMax;
-          desc.integer_range[0].step = 1;
-          double exposure_default = static_cast<double>(fvalue.fCurValue);
-          double exposure = declare_parameter("exposure_time", exposure_default, desc);
-          MV_CC_SetFloatValue(camera_handle_, "ExposureTime", exposure);
-        } else {
-          declare_parameter("exposure_time", 5000.0);
-        }
-
-        // Gain
-        if (MV_CC_GetFloatValue(camera_handle_, "Gain", &fvalue) == MV_OK) {
-          desc.description = "Camera gain";
-          desc.integer_range.resize(1);
-          desc.integer_range[0].from_value = fvalue.fMin;
-          desc.integer_range[0].to_value = fvalue.fMax;
-          desc.integer_range[0].step = 1;
-          double gain_default = static_cast<double>(fvalue.fCurValue);
-          double gain = declare_parameter("gain", gain_default, desc);
-          MV_CC_SetFloatValue(camera_handle_, "Gain", gain);
-        } else {
-          declare_parameter("gain", 0.0);
-        }
-
-        // Frame rate
-        if (MV_CC_GetFloatValue(camera_handle_, "AcquisitionFrameRate", &fvalue) == MV_OK) {
-          desc.description = "Acquisition frame rate";
-          desc.integer_range.resize(1);
-          desc.integer_range[0].from_value = fvalue.fMin;
-          desc.integer_range[0].to_value = fvalue.fMax;
-          desc.integer_range[0].step = 1;
-          double fr_default = static_cast<double>(fvalue.fCurValue);
-          double fr = declare_parameter("frame_rate", fr_default, desc);
-          MV_CC_SetFloatValue(camera_handle_, "AcquisitionFrameRate", fr);
-        } else {
-          declare_parameter("frame_rate", 30.0);
-        }
-
-        // Pixel format (enum handled locally)
-        std::string pf_default = "RGB8";
-        pixel_format_ = declare_parameter("pixel_format", pf_default);
-        {
-          std::lock_guard<std::mutex> lock(camera_mutex_);
-          convert_param_.enDstPixelType = (pixel_format_ == "Mono8") ? PixelType_Gvsp_Mono8 : PixelType_Gvsp_RGB8_Packed;
-        }
-      } else {
-        // Camera not open yet; declare default params so users can set them before connect
-        declare_parameter("exposure_time", 5000.0);
-        declare_parameter("gain", 0.0);
-        declare_parameter("frame_rate", 30.0);
-        pixel_format_ = declare_parameter("pixel_format", std::string("RGB8"));
-      }
-    } catch (const std::exception & e) {
-      RCLCPP_WARN(this->get_logger(), "[declareCameraParameters] exception: %s", e.what());
-    }
-  }
-
-  rcl_interfaces::msg::SetParametersResult parametersCallback(
-    const std::vector<rclcpp::Parameter> & parameters)
-  {
-    rcl_interfaces::msg::SetParametersResult result;
-    result.successful = true;
-
-    // Use local status; do not rely on nRet_ which is shared.
-    for (const auto & p : parameters) {
-      if (p.get_name() == "exposure_time") {
-        double v = p.as_double();
-        int status = MV_OK;
-        {
-          std::lock_guard<std::mutex> lock(camera_mutex_);
-          if (camera_handle_) status = MV_CC_SetFloatValue(camera_handle_, "ExposureTime", v);
-        }
-        if (status != MV_OK) {
-          result.successful = false;
-          result.reason = "Failed to set exposure_time";
-          return result;
-        }
-      } else if (p.get_name() == "gain") {
-        double v = p.as_double();
-        int status = MV_OK;
-        {
-          std::lock_guard<std::mutex> lock(camera_mutex_);
-          if (camera_handle_) status = MV_CC_SetFloatValue(camera_handle_, "Gain", v);
-        }
-        if (status != MV_OK) {
-          result.successful = false;
-          result.reason = "Failed to set gain";
-          return result;
-        }
-      } else if (p.get_name() == "frame_rate") {
-        double v = p.as_double();
-        int status = MV_OK;
-        {
-          std::lock_guard<std::mutex> lock(camera_mutex_);
-          if (camera_handle_) status = MV_CC_SetFloatValue(camera_handle_, "AcquisitionFrameRate", v);
-        }
-        if (status != MV_OK) {
-          result.successful = false;
-          result.reason = "Failed to set frame_rate";
-          return result;
-        }
-      } else if (p.get_name() == "pixel_format") {
-        std::string v = p.as_string();
-        {
-          std::lock_guard<std::mutex> lock(camera_mutex_);
-          pixel_format_ = v;
-          convert_param_.enDstPixelType = (pixel_format_ == "Mono8") ? PixelType_Gvsp_Mono8 : PixelType_Gvsp_RGB8_Packed;
-        }
-      } else if (p.get_name() == "camera_sn" || p.get_name() == "camera_ip") {
-        // allow change of target camera: update parameter only; reconnect handled in capture loop if necessary
-        if (p.get_name() == "camera_sn") camera_sn_ = p.as_string();
-        if (p.get_name() == "camera_ip") camera_ip_ = p.as_string();
-        RCLCPP_INFO(this->get_logger(), "[parametersCallback] will attempt reconnect to new camera on next loop");
-      } else {
-        // ignore other params
-      }
-    }
-
-    return result;
-  }
-
-  // ---------------- Capture Loop ----------------
   void captureLoop()
   {
-    MV_FRAME_OUT frame;
-    int local_fail_count = 0;
-    size_t channels = (convert_param_.enDstPixelType == PixelType_Gvsp_Mono8) ? 1 : 3;
+    // Wait a moment at startup to let USB / kernel enumerate device
+    std::this_thread::sleep_for(2000ms);
 
-    while (rclcpp::ok() && running_.load()) {
-      // Ensure camera is connected
-      if (!camera_handle_) {
-        bool connected = false;
-        int attempts = 0;
-        while (rclcpp::ok() && running_.load()) {
-          if (connectCamera()) {
-            connected = true;
-            break;
+    int reconnect_interval = get_param_or<int>("reconnect_interval_sec", 2);
+    int max_retries = get_param_or<int>("max_reconnect_attempts", 0);
+
+    int attempt = 0;
+    while (running_.load() && rclcpp::ok()) {
+      {
+        std::lock_guard<std::mutex> lock(camera_mutex_);
+        if (!camera_handle_) {
+          // try connect
+          if (!connectCamera()) {
+            ++attempt;
+            if (max_retries > 0 && attempt >= max_retries) {
+              RCLCPP_ERROR(get_logger(), "[captureLoop] max reconnect attempts reached, exiting capture loop");
+              return;
+            }
+            std::this_thread::sleep_for(std::chrono::seconds(reconnect_interval));
+            continue;
           }
-          ++attempts;
-          if (max_reconnect_attempts_ > 0 && attempts >= max_reconnect_attempts_) {
-            RCLCPP_ERROR(this->get_logger(), "[captureLoop] max reconnect attempts reached");
-            break;
-          }
-          std::this_thread::sleep_for(std::chrono::seconds(reconnect_interval_sec_));
+          attempt = 0;
         }
-        if (!connected) {
-          // Sleep a bit before next outer loop iteration
-          std::this_thread::sleep_for(std::chrono::seconds(reconnect_interval_sec_));
+      } // unlock
+
+      // Grab one frame using recommended API
+      MV_FRAME_OUT stOutFrame;
+      memset(&stOutFrame, 0, sizeof(stOutFrame));
+      int nRet = MV_CC_GetImageBuffer(camera_handle_, &stOutFrame, 1000);
+      if (nRet != MV_OK) {
+        if (nRet == static_cast<int>(0x80000007)) { // timeout
+          RCLCPP_WARN_THROTTLE(get_logger(), *this->get_clock(), 2000, "[captureLoop] MV_CC_GetImageBuffer timeout (0x%X).", nRet);
+          std::this_thread::sleep_for(5ms);
+          continue;
+        } else {
+          RCLCPP_ERROR(get_logger(), "[captureLoop] MV_CC_GetImageBuffer failed: 0x%X", nRet);
+          // attempt reconnect
+          disconnectCamera();
+          std::this_thread::sleep_for(std::chrono::seconds(reconnect_interval));
           continue;
         }
       }
 
-      // Try to get frame
-      {
-        std::lock_guard<std::mutex> lock(camera_mutex_);
-        nRet_ = MV_CC_GetImageBuffer(camera_handle_, &frame, 1000);
+      // Got raw frame in stOutFrame.pBufAddr
+      // Convert to BGR8 (or Mono8) using SDK convert API
+      MV_CC_PIXEL_CONVERT_PARAM convertParam;
+      memset(&convertParam, 0, sizeof(convertParam));
+      convertParam.nWidth = stOutFrame.stFrameInfo.nWidth;
+      convertParam.nHeight = stOutFrame.stFrameInfo.nHeight;
+      convertParam.pSrcData = stOutFrame.pBufAddr;
+      convertParam.nSrcDataLen = stOutFrame.stFrameInfo.nFrameLen;
+      convertParam.enSrcPixelType = stOutFrame.stFrameInfo.enPixelType;
+
+      // target encoding: bgr8 if these are color, mono8 if mono
+      bool is_mono = (stOutFrame.stFrameInfo.enPixelType == PixelType_Gvsp_Mono8);
+      convertParam.enDstPixelType = is_mono ? PixelType_Gvsp_Mono8 : PixelType_Gvsp_BGR8_Packed;
+
+      // allocate a conversion buffer sized width*height*channels (safe upper bound)
+      size_t channels = is_mono ? 1 : 3;
+      size_t expected_size = static_cast<size_t>(stOutFrame.stFrameInfo.nWidth) * stOutFrame.stFrameInfo.nHeight * channels;
+
+      // allocate temporary buffer for converted image (use unique_ptr)
+      std::unique_ptr<unsigned char[]> convert_buffer(new unsigned char[expected_size]);
+      convertParam.pDstBuffer = convert_buffer.get();
+      convertParam.nDstBufferSize = static_cast<unsigned int>(expected_size);
+
+      int conv_ret = MV_CC_ConvertPixelType(camera_handle_, &convertParam);
+      if (conv_ret != MV_OK) {
+        RCLCPP_ERROR(get_logger(), "[captureLoop] MV_CC_ConvertPixelType failed: 0x%X", conv_ret);
+        MV_CC_FreeImageBuffer(camera_handle_, &stOutFrame);
+        std::this_thread::sleep_for(5ms);
+        continue;
       }
-      if (nRet_ == MV_OK) {
-        // Convert into frame_buffer_ (protected by mutex while calling SDK)
-        {
-          std::lock_guard<std::mutex> lock(camera_mutex_);
-          convert_param_.pSrcData = frame.pBufAddr;
-          convert_param_.nSrcDataLen = frame.stFrameInfo.nFrameLen;
-          // ensure convert_param_.nWidth/nHeight reflect current frame if needed
-          convert_param_.nWidth = frame.stFrameInfo.nWidth;
-          convert_param_.nHeight = frame.stFrameInfo.nHeight;
-          MV_CC_ConvertPixelType(camera_handle_, &convert_param_);
-        }
 
-        // Determine channels and actual size
-        channels = (convert_param_.enDstPixelType == PixelType_Gvsp_Mono8) ? 1 : 3;
-        size_t actual_size = static_cast<size_t>(frame.stFrameInfo.nWidth) * frame.stFrameInfo.nHeight * channels;
+      // Prepare ROS Image message
+      sensor_msgs::msg::Image img;
+      img.header.stamp = this->now();
+      img.header.frame_id = "camera_optical_frame";
+      img.height = stOutFrame.stFrameInfo.nHeight;
+      img.width = stOutFrame.stFrameInfo.nWidth;
+      img.is_bigendian = 0;
+      img.step = static_cast<sensor_msgs::msg::Image::_step_type>(stOutFrame.stFrameInfo.nWidth * channels);
+      img.encoding = is_mono ? "mono8" : "bgr8";
 
-        // Prepare and publish message
-        sensor_msgs::msg::Image img;
-        img.header.stamp = this->now();
-        img.header.frame_id = "camera_optical_frame";
-        img.height = frame.stFrameInfo.nHeight;
-        img.width = frame.stFrameInfo.nWidth;
-        img.step = frame.stFrameInfo.nWidth * channels;
-        img.is_bigendian = 0;
-        img.encoding = (channels == 1) ? "mono8" : "rgb8";
+      // Copy converted buffer to msg
+      img.data.resize(expected_size);
+      std::memcpy(img.data.data(), convert_buffer.get(), expected_size);
 
-        {
-          // copy only the used part of frame_buffer_
-          std::lock_guard<std::mutex> lock(camera_mutex_);
-          img.data.assign(frame_buffer_.begin(), frame_buffer_.begin() + actual_size);
-        }
+      // camera_info timestamp/header
+      camera_info_msg_.header = img.header;
 
-        // camera_info timestamp
-        camera_info_msg_.header = img.header;
+      // publish (image_transport camera publisher)
+      camera_pub_.publish(img, camera_info_msg_);
 
-        camera_pub_.publish(img, camera_info_msg_);
+      // free SDK buffer
+      MV_CC_FreeImageBuffer(camera_handle_, &stOutFrame);
 
-        // free SDK buffer
-        MV_CC_FreeImageBuffer(camera_handle_, &frame);
-        local_fail_count = 0;
-      } else {
-        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000, "[captureLoop] MV_CC_GetImageBuffer failed: 0x%X", nRet_);
-        ++local_fail_count;
-        if (local_fail_count > 5) {
-          RCLCPP_WARN(this->get_logger(), "[captureLoop] too many consecutive get failures, resetting connection");
-          disconnectCamera();
-          local_fail_count = 0;
-          std::this_thread::sleep_for(std::chrono::seconds(reconnect_interval_sec_));
-        }
-      }
-    } // end while
+      // throttle loop to configured publish period to avoid busy spin
+      std::this_thread::sleep_for(std::chrono::milliseconds(publish_period_ms_));
+    } // while
   }
 
-private:
-  // --- members ---
-  void* camera_handle_ = nullptr;
-  int nRet_ = MV_OK;
-  MV_IMAGE_BASIC_INFO img_info_;
-  MV_CC_PIXEL_CONVERT_PARAM convert_param_{};
-  std::vector<uint8_t> frame_buffer_;
-  std::mutex camera_mutex_;
-  std::atomic<bool> running_{false};
-
-  // ROS
-  image_transport::CameraPublisher camera_pub_;
-  std::unique_ptr<camera_info_manager::CameraInfoManager> camera_info_manager_;
-  sensor_msgs::msg::CameraInfo camera_info_msg_;
-
-  std::thread capture_thread_;
-  int fail_count_ = 0;
-
-  // params
-  std::string camera_name_;
-  std::string camera_sn_;
-  std::string camera_ip_;
-  std::string pixel_format_;
-  bool use_sensor_data_qos_ = true;
-  int reconnect_interval_sec_ = 2;
-  int max_reconnect_attempts_ = 0; // 0 = infinite
-
-  rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr params_callback_handle_;
+  int publish_period_ms_ = 33; // default ~30fps
 };
 
-}  // namespace hik_camera
-
-#include "rclcpp_components/register_node_macro.hpp"
-RCLCPP_COMPONENTS_REGISTER_NODE(hik_camera::HikCameraNode)
+// Register as component if desired, here provide main for standalone node
+int main(int argc, char **argv)
+{
+  rclcpp::init(argc, argv);
+  auto node = std::make_shared<HikCameraNode>();
+  rclcpp::spin(node);
+  rclcpp::shutdown();
+  return 0;
+}

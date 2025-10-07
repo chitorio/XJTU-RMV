@@ -1,10 +1,26 @@
 /**:
   ros__parameters:
-    camera_sn: ""               # 可选：指定相机序列号（空表示自动连接）
-    camera_ip: ""               # 可选：指定相机IP
-    exposure_time: 20000.0      # 微秒，典型范围 100 - 100000
-    gain: 10.0                  # dB
-    frame_rate: 180.0            # 帧率 Hz
-    pixel_format: "RGB8"        # 可选值: "RGB8", "BGR8", "Mono8"
-    image_topic: "/image_raw"   # 发布的话题名
-    use_sensor_data_qos: false  # 是否使用 sensor_data QoS（用于图像话题）
+    # 相机识别信息（可选）
+    camera_sn: ""             # 可填序列号，例如 "KE01012345"；留空则自动使用第一个USB相机
+    camera_ip: ""             # 仅GigE相机使用，USB可留空
+
+    # 基本采集参数
+    exposure_time: 80000.0    # 微秒，亮度不足时可适当加大 (范围 100-1000000)
+    gain: 10.0                # dB，调大画面更亮但噪声增加
+    frame_rate: 30.0          # 帧率 Hz
+    pixel_format: "BGR8"      # 可选: "BGR8" 或 "Mono8"
+
+    # 分辨率设置（需符合相机支持的值）
+    width: 640
+    height: 480
+
+    # 发布设置
+    image_topic: "/image_raw"
+    use_sensor_data_qos: true
+
+    # 相机标定文件（可选）
+    camera_info_url: "package://task/config/camera_info.yaml"
+
+    # 断线重连策略
+    reconnect_interval_sec: 2
+    max_reconnect_attempts: 0    # 0 表示无限重试
