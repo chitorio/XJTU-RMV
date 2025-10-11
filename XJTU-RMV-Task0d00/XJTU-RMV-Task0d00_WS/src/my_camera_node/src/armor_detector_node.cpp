@@ -5,46 +5,49 @@
 #include <cv_bridge/cv_bridge.h>
 #include <opencv2/opencv.hpp>
 #include <vector>
-
-// 新增：用于处理参数事件
 #include <rclcpp/parameter_event_handler.hpp>
 
 using namespace std;
 using namespace cv;
+
+// CORRECTED: A helper function to safely scale a rectangle (ROI)
+// scale_x, scale_y > 1.0 indicates enlargement
+cv::Rect scale_rect(const cv::Rect &r, float scale_x, float scale_y) {
+    // Explicitly cast r.tl() to cv::Point2f to resolve the type mismatch error
+    cv::Point2f center = cv::Point2f(r.tl()) + cv::Point2f(r.width * 0.5f, r.height * 0.5f);
+    float new_w = r.width * scale_x;
+    float new_h = r.height * scale_y;
+    return cv::Rect(
+        static_cast<int>(center.x - new_w * 0.5f),
+        static_cast<int>(center.y - new_h * 0.5f),
+        static_cast<int>(new_w),
+        static_cast<int>(new_h)
+    );
+}
+
 
 class ArmorDetectorNode : public rclcpp::Node
 {
 public:
   ArmorDetectorNode() : Node("armor_detector_node")
   {
-    // 1. 创建订阅者，订阅原始图像话题
     subscription_ = image_transport::create_subscription(
       this, "image_raw", 
       std::bind(&ArmorDetectorNode::imageCallback, this, std::placeholders::_1),
       "raw", rmw_qos_profile_sensor_data);
 
-    // 2. 创建发布者，用于发布带有识别结果的图像
     result_image_pub_ = image_transport::create_publisher(this, "armor_detector/result_image");
     
-    // ======================= 新增代码 [开始] =======================
-    
-    // 3. 声明并获取 `debug` 参数，用于控制是否开启调试模式
-    // 默认设置为 true，方便您立即看到调试图像
     debug_ = this->declare_parameter("debug", true);
 
-    // 如果 `debug` 模式开启，则创建调试相关的发布者
     if (debug_) {
       createDebugPublishers();
     }
     
-    // 4. 设置参数回调，以便在运行时动态开启/关闭 debug 模式
-    // 例如，您可以使用命令行: ros2 param set /armor_detector_node debug false
     param_subscriber_ = std::make_shared<rclcpp::ParameterEventHandler>(this);
     param_callback_handle_ = param_subscriber_->add_parameter_callback("debug",
       [this](const rclcpp::Parameter & p) {
-        // 更新 debug 标志
         this->debug_ = p.as_bool();
-        // 根据新的标志值，创建或销毁调试发布者
         if (this->debug_) {
           this->createDebugPublishers();
         } else {
@@ -52,26 +55,69 @@ public:
         }
       });
       
-    // ======================= 新增代码 [结束] =======================
-    
     RCLCPP_INFO(this->get_logger(), "Armor Detector Node has been started.");
   }
 
 private:
-  // 核心回调函数，每当接收到新图像时执行
+  // Core callback function with ROI logic
   void imageCallback(const sensor_msgs::msg::Image::ConstSharedPtr & msg)
   {
     try {
-      // 将ROS图像消息转换为OpenCV图像格式
       cv_bridge::CvImagePtr cv_ptr = cv_bridge::toCvCopy(msg, sensor_msgs::image_encodings::BGR8);
       Mat frame = cv_ptr->image;
       
-      // 调用装甲板检测函数
-      Mat result_frame;
-      // 修改：将消息头传入，以便调试信息的时间戳保持一致
-      detectLightBar(frame, result_frame, msg->header); 
+      Mat result_frame = frame.clone(); // Image for drawing the final result
+      Mat processing_frame;             // The actual image being processed (full or ROI)
+      cv::Point roi_offset(0, 0);       // Top-left offset of the ROI relative to the full image
 
-      // 将处理后的OpenCV图像转换回ROS消息并发布
+      // ======================= ROI Logic [Start] =======================
+      if (tracking_mode_) {
+        // 1. In tracking mode, expand the previous ROI to define the current processing area
+        cv::Rect potential_roi = scale_rect(last_armor_roi_, 2.0, 1.5);
+        // 2. Ensure the ROI does not exceed the image boundaries
+        last_armor_roi_ = potential_roi & cv::Rect(0, 0, frame.cols, frame.rows);
+        
+        processing_frame = frame(last_armor_roi_);
+        roi_offset = last_armor_roi_.tl();
+        
+        // Draw the ROI area on the result image for debugging purposes
+        cv::rectangle(result_frame, last_armor_roi_, cv::Scalar(0, 255, 255), 2);
+      } else {
+        // 3. If not in tracking mode, process the entire image
+        processing_frame = frame;
+      }
+      // ======================= ROI Logic [End] =======================
+
+      // Call the detection function, passing the processing image and the offset
+      vector<RotatedRect> found_armors = detectLightBar(
+          processing_frame, result_frame, msg->header, roi_offset);
+
+      // ======================= Update Tracking State [Start] =======================
+      if (!found_armors.empty()) {
+        // If a target is found
+        tracking_mode_ = true;
+        lost_count_ = 0;
+        // Update the ROI to be the bounding box of the first found armor
+        last_armor_roi_ = found_armors[0].boundingRect();
+        
+        // Draw the found armors
+        for (const auto& armor : found_armors) {
+            Point2f pts[4];
+            armor.points(pts);
+            for (int k = 0; k < 4; k++) {
+                line(result_frame, pts[k], pts[(k + 1) % 4], Scalar(0, 255, 0), 2);
+            }
+        }
+      } else {
+        // If no target is found
+        lost_count_++;
+        // If the target is lost for more than 10 consecutive frames, exit tracking mode and return to full-image search
+        if (lost_count_ > 10) {
+          tracking_mode_ = false;
+        }
+      }
+      // ======================= Update Tracking State [End] =======================
+
       sensor_msgs::msg::Image::SharedPtr result_msg = 
         cv_bridge::CvImage(msg->header, "bgr8", result_frame).toImageMsg();
       result_image_pub_.publish(result_msg);
@@ -81,79 +127,100 @@ private:
     }
   }
 
-  // 修改：函数签名增加一个 header 参数，用于发布调试消息
-  void detectLightBar(const Mat& src, Mat &dst, const std_msgs::msg::Header & header) {
-      dst = src.clone();
+  // Modified: The function returns a list of found armors and accepts an ROI offset
+  // 修改：函数返回找到的装甲板列表，并接受ROI偏移量
+  vector<RotatedRect> detectLightBar(const Mat& src, Mat &dst_to_draw_on, const std_msgs::msg::Header & header, const cv::Point & offset) {
+      // ======================= 核心修改：采用灰度阈值法 [开始] =======================
       
-      // 1. 将原图从 BGR 转换到 HSV 色彩空间
-      Mat hsv;
-      cvtColor(src, hsv, COLOR_BGR2HSV);
+      // 1. 将原图转换为灰度图
+      Mat gray_img;
+      cvtColor(src, gray_img, COLOR_BGR2GRAY);
 
-      // 2. 定义 蓝色 装甲板的HSV阈值范围
-      cv::Scalar lower_blue(100, 80, 80);
-      cv::Scalar upper_blue(130, 255, 255);
+      // 2. 根据亮度进行二值化
+      // 这个阈值 `binary_thres` 是一个关键参数，需要根据实际场景亮度进行调整。
+      // 可以先从 160 开始尝试。灯条越亮，这个值可以设得越高。
+      Mat binary_img;
+      int binary_thres = 160; 
+      cv::threshold(gray_img, binary_img, binary_thres, 255, cv::THRESH_BINARY);
+      
+      // (可选) HSV方法被注释掉，作为对比保留
+      // Mat hsv;
+      // cvtColor(src, hsv, COLOR_BGR2HSV);
+      // cv::Scalar lower_blue(100, 80, 80);
+      // cv::Scalar upper_blue(130, 255, 255);
+      // cv::inRange(hsv, lower_blue, upper_blue, binary_img);
 
-      // 3. 创建一个二值化的掩码（Mask）
-      Mat binary;
-      cv::inRange(hsv, lower_blue, upper_blue, binary);
-
-      // 4. 使用形态学操作清理掩码中的噪点
+      // 3. 形态学操作（现在对于更干净的二值图可能需要调整或省略）
       Mat kernel = getStructuringElement(MORPH_RECT, Size(3, 3));
-      morphologyEx(binary, binary, MORPH_OPEN, kernel);
+      morphologyEx(binary_img, binary_img, MORPH_OPEN, kernel);
 
-      // ======================= 新增代码 [开始] =======================
-      // 5. 如果开启了调试模式，则发布二值化掩码图
+      // ======================= 核心修改：采用灰度阈值法 [结束] =======================
+
+
       if (debug_) {
-        // 将单通道的二值图(binary)封装成ROS图像消息并发布
-        // 注意编码格式为 "mono8"
-        auto mask_msg = cv_bridge::CvImage(header, "mono8", binary).toImageMsg();
+        // 发布的调试图像现在是基于灰度阈值的结果
+        auto mask_msg = cv_bridge::CvImage(header, "mono8", binary_img).toImageMsg();
         binary_mask_pub_.publish(std::move(mask_msg));
       }
-      // ======================= 新增代码 [结束] =======================
 
+      // 4. 寻找轮廓 (后续逻辑保持不变)
       vector<vector<Point>> contours;
-      findContours(binary, contours, RETR_EXTERNAL, CHAIN_APPROX_SIMPLE);
+      findContours(binary_img, contours, RETR_EXTERNAL, CHAIN_APPROX_SIMPLE);
 
-      // ... 后续的灯条筛选和装甲板匹配代码保持不变 ...
+      // 5. 筛选灯条
       vector<RotatedRect> lightBars;
       for (const auto& cont : contours) {
         double area = contourArea(cont);
         if (area < 15 || area > 500) continue;
         if (cont.size() < 5) continue;
+        
         RotatedRect r = minAreaRect(cont);
         float longSide = max(r.size.width, r.size.height);
         float shortSide = min(r.size.width, r.size.height);
         if (shortSide < 1e-5) continue;
+        
         float ratio = longSide / shortSide;
         if (ratio < 1.5 || ratio > 10.0) continue;
+        
         lightBars.push_back(r);
       }
       
+      vector<RotatedRect> found_armors; // 存储本函数找到的装甲板
+
+      // 6. 配对灯条
       for (size_t i = 0; i < lightBars.size(); i++) {
           for (size_t j = i + 1; j < lightBars.size(); j++) {
               float angle_i = normalizedAngle(lightBars[i]);
               float angle_j = normalizedAngle(lightBars[j]);
               if (fabs(angle_i - angle_j) > 10.0) continue;
+              
               float height_i = max(lightBars[i].size.width, lightBars[i].size.height);
               float height_j = max(lightBars[j].size.width, lightBars[j].size.height);
               if (fabs(height_i - height_j) / max(height_i, height_j) > 0.2) continue;
+              
               Point2f center_diff = lightBars[i].center - lightBars[j].center;
               float distance = sqrt(center_diff.ddot(center_diff));
               float avg_height = (height_i + height_j) * 0.5;
               if(distance / avg_height < 1.0 || distance / avg_height > 5.0) continue;
-              Point2f pts[4];
-              RotatedRect armorRect = RotatedRect((lightBars[i].center + lightBars[j].center) * 0.5f,
-                                                 Size2f(distance, avg_height), 
-                                                 (angle_i + angle_j) * 0.5f);
-              armorRect.points(pts);
-              for (int k = 0; k < 4; k++) {
-                  line(dst, pts[k], pts[(k + 1) % 4], Scalar(0, 255, 0), 2);
-              }
+              
+              RotatedRect armorRect = RotatedRect(
+                  (lightBars[i].center + lightBars[j].center) * 0.5f,
+                  Size2f(distance, avg_height), 
+                  (angle_i + angle_j) * 0.5f
+              );
+              
+              // 将ROI内的坐标转换回全图坐标
+              armorRect.center.x += offset.x;
+              armorRect.center.y += offset.y;
+
+              found_armors.push_back(armorRect);
           }
       }
+      
+      // 返回找到的装甲板列表
+      return found_armors;
   }
 
-  // 和之前的代码一样
   static float normalizedAngle(const RotatedRect& r) {
       float w = r.size.width, h = r.size.height, ang = r.angle;
       if (w < h) ang += 90.0f;
@@ -161,38 +228,34 @@ private:
       return ang;
   }
 
-  // ======================= 新增代码 [开始] =======================
-  void createDebugPublishers()
-  {
-    // 如果发布者还未创建，则创建它
+  void createDebugPublishers() {
     if (!binary_mask_pub_) {
       binary_mask_pub_ = image_transport::create_publisher(this, "armor_detector/binary_mask");
       RCLCPP_INFO(this->get_logger(), "Debug mode enabled. Publishing binary mask topic.");
     }
   }
 
-  void destroyDebugPublishers()
-  {
-    // 如果发布者已存在，则销毁它
+  void destroyDebugPublishers() {
     if (binary_mask_pub_) {
       binary_mask_pub_.shutdown();
-      // 在新版 image_transport 中，shutdown() 后最好将指针置空
       binary_mask_pub_ = {}; 
       RCLCPP_INFO(this->get_logger(), "Debug mode disabled. Stopped publishing binary mask topic.");
     }
   }
-  // ======================= 新增代码 [结束] =======================
 
-  // 成员变量
+  // Member variables
   image_transport::Subscriber subscription_;
   image_transport::Publisher result_image_pub_;
-
-  // ======================= 新增代码 [开始] =======================
+  
   bool debug_;
   image_transport::Publisher binary_mask_pub_;
   std::shared_ptr<rclcpp::ParameterEventHandler> param_subscriber_;
   std::shared_ptr<rclcpp::ParameterCallbackHandle> param_callback_handle_;
-  // ======================= 新增代码 [结束] =======================
+
+  // State variables for ROI tracking
+  bool tracking_mode_ = false;  // Is it in tracking mode?
+  cv::Rect last_armor_roi_;     // ROI of the armor from the previous frame
+  int lost_count_ = 0;          // Frame count of consecutive target loss
 };
 
 int main(int argc, char * argv[])

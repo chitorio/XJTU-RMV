@@ -51,14 +51,13 @@ private:
       RCLCPP_INFO(this->get_logger(), "End of video file. Restarting.");
       cap_.set(cv::CAP_PROP_POS_FRAMES, 0); // 循环播放
       cap_ >> frame;
-      if(frame.empty()) return; // 如果视频还是空的，则退出
     }
 
-    cv::resize(frame, frame, cv::Size(640, 480));
+    // cv::resize(frame, frame, cv::Size(640, 480));
 
     // 将OpenCV图像转换为ROS消息并发布
     sensor_msgs::msg::Image::SharedPtr msg = 
-      cv_bridge::CvImage(std_msgs::msg::Header(), "bgr8", frame).toImageMsg();
+      cv_bridge::CvImage(std_msgs::msg::Header(), "BGR8", frame).toImageMsg();
     publisher_.publish(msg);
   }
 
