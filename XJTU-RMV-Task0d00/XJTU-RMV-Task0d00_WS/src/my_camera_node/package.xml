@@ -1,0 +1,46 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <!-- 替换成你自己的包名 -->
+  <name>my_camera_node</name>
+  <version>0.0.1</version>
+  <description>A package for detecting RoboMaster armor plates using Hikvision cameras or video files.</description>
+
+  <!-- 替换成你自己的信息 -->
+  <maintainer email="user@todo.todo">Your Name</maintainer>
+  <license>Apache-2.0</license> <!-- 或者其他你选择的开源协议 -->
+
+  <!-- 指定构建工具为 ament_cmake，因为我们用的是C++ -->
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <!-- 
+    列出所有的依赖项。
+    使用 <depend> 会同时涵盖构建、执行和测试依赖，对于大多数情况来说最简单。
+  -->
+  
+  <!-- ROS 2核心客户端库 -->
+  <depend>rclcpp</depend>
+  
+  <!-- 用于创建可组合节点 -->
+  <depend>rclcpp_components</depend>
+
+  <!-- 用于高效地发布和订阅图像话题 -->
+  <depend>image_transport</depend>
+
+  <!-- 用于管理相机标定文件 -->
+  <depend>camera_info_manager</depend>
+
+  <!-- 包含标准的ROS消息类型，如 Image 和 CameraInfo -->
+  <depend>sensor_msgs</depend>
+
+  <!-- 在ROS Image消息和OpenCV Mat之间进行转换的桥梁 -->
+  <depend>cv_bridge</depend>
+
+  <!-- 测试依赖 -->
+  <test_depend>ament_lint_auto</test_depend>
+  <test_depend>ament_lint_common</test_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
