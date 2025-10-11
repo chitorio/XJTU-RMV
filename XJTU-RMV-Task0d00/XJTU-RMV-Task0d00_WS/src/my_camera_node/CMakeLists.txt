@@ -69,6 +69,13 @@ target_link_libraries(video_publisher_node
   ${OpenCV_LIBS}
 )
 
+# --- 4. 构建三合一相机节点 (作为独立可执行文件) ---
+ament_auto_add_executable(multi_source_camera_node
+  src/multi_source_camera_node.cpp
+)
+target_link_libraries(multi_source_camera_node
+  ${OpenCV_LIBS}
+)
 
 # --- 测试、安装和打包 ---
 # 这部分保持不变，ament_cmake_auto 会自动处理新创建的可执行文件的安装

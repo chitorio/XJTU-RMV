@@ -4,264 +4,279 @@
 #include <image_transport/image_transport.hpp>
 #include <cv_bridge/cv_bridge.h>
 #include <opencv2/opencv.hpp>
-#include <vector>
-#include <rclcpp/parameter_event_handler.hpp>
 
-using namespace std;
-using namespace cv;
-
-// CORRECTED: A helper function to safely scale a rectangle (ROI)
-// scale_x, scale_y > 1.0 indicates enlargement
-cv::Rect scale_rect(const cv::Rect &r, float scale_x, float scale_y) {
-    // Explicitly cast r.tl() to cv::Point2f to resolve the type mismatch error
-    cv::Point2f center = cv::Point2f(r.tl()) + cv::Point2f(r.width * 0.5f, r.height * 0.5f);
-    float new_w = r.width * scale_x;
-    float new_h = r.height * scale_y;
-    return cv::Rect(
-        static_cast<int>(center.x - new_w * 0.5f),
-        static_cast<int>(center.y - new_h * 0.5f),
-        static_cast<int>(new_w),
-        static_cast<int>(new_h)
-    );
-}
-
-
-class ArmorDetectorNode : public rclcpp::Node
+class FastArmorDetector : public rclcpp::Node
 {
 public:
-  ArmorDetectorNode() : Node("armor_detector_node")
+  FastArmorDetector() : Node("fast_armor_detector")
   {
+    // 高性能QoS
+    auto qos = rclcpp::QoS(rclcpp::KeepLast(1)).best_effort();
+    
+    // 订阅图像
     subscription_ = image_transport::create_subscription(
       this, "image_raw", 
-      std::bind(&ArmorDetectorNode::imageCallback, this, std::placeholders::_1),
-      "raw", rmw_qos_profile_sensor_data);
+      [this](const sensor_msgs::msg::Image::ConstSharedPtr& msg) {
+        this->detectCallback(msg);
+      },
+      "raw", qos.get_rmw_qos_profile());
 
-    result_image_pub_ = image_transport::create_publisher(this, "armor_detector/result_image");
+    // 发布结果
+    result_pub_ = image_transport::create_publisher(this, "armor_detector/result", qos.get_rmw_qos_profile());
     
-    debug_ = this->declare_parameter("debug", true);
+    // 参数
+    this->declare_parameter("binary_thres", 150);
+    this->declare_parameter("detect_color", 1); // 0: RED, 1: BLUE
+    this->declare_parameter("debug", false);
+    
+    binary_thres_ = this->get_parameter("binary_thres").as_int();
+    detect_color_ = this->get_parameter("detect_color").as_int();
+    debug_ = this->get_parameter("debug").as_bool();
 
-    if (debug_) {
-      createDebugPublishers();
-    }
-    
-    param_subscriber_ = std::make_shared<rclcpp::ParameterEventHandler>(this);
-    param_callback_handle_ = param_subscriber_->add_parameter_callback("debug",
-      [this](const rclcpp::Parameter & p) {
-        this->debug_ = p.as_bool();
-        if (this->debug_) {
-          this->createDebugPublishers();
-        } else {
-          this->destroyDebugPublishers();
-        }
-      });
-      
-    RCLCPP_INFO(this->get_logger(), "Armor Detector Node has been started.");
+    RCLCPP_INFO(this->get_logger(), "Fast Armor Detector started");
   }
 
 private:
-  // Core callback function with ROI logic
-  void imageCallback(const sensor_msgs::msg::Image::ConstSharedPtr & msg)
+  struct Light {
+    cv::Rect rect;
+    cv::Point2f top, bottom;
+    double length;
+    double width;
+    cv::Point2f center;
+    float tilt_angle;
+    int color; // 0: RED, 1: BLUE
+    
+    Light(cv::Rect r, cv::Point2f t, cv::Point2f b, double l, double w, float angle)
+      : rect(r), top(t), bottom(b), length(l), width(w), tilt_angle(angle)
+    {
+      center = (top + bottom) * 0.5f;
+    }
+  };
+
+  struct Armor {
+    Light left_light, right_light;
+    int type; // 0: SMALL, 1: LARGE
+    
+    Armor(const Light& l1, const Light& l2) : left_light(l1), right_light(l2) {}
+  };
+
+  void detectCallback(const sensor_msgs::msg::Image::ConstSharedPtr& msg)
   {
+    auto start_time = std::chrono::high_resolution_clock::now();
+    
     try {
-      cv_bridge::CvImagePtr cv_ptr = cv_bridge::toCvCopy(msg, sensor_msgs::image_encodings::BGR8);
-      Mat frame = cv_ptr->image;
+      cv_bridge::CvImageConstPtr cv_ptr = cv_bridge::toCvShare(msg, "bgr8");
+      const cv::Mat& frame = cv_ptr->image;
       
-      Mat result_frame = frame.clone(); // Image for drawing the final result
-      Mat processing_frame;             // The actual image being processed (full or ROI)
-      cv::Point roi_offset(0, 0);       // Top-left offset of the ROI relative to the full image
+      // 预处理
+      cv::Mat binary_img = preprocessImage(frame);
+      
+      // 查找灯条
+      std::vector<Light> lights = findLights(frame, binary_img);
+      
+      // 匹配装甲板
+      std::vector<Armor> armors = matchLights(lights);
+      
+      // 发布结果
+      publishResult(frame, armors, msg->header);
+      
+      // 性能统计
+      logPerformance(start_time);
+      
+    } catch (const std::exception& e) {
+      RCLCPP_ERROR(this->get_logger(), "Detection error: %s", e.what());
+    }
+  }
 
-      // ======================= ROI Logic [Start] =======================
-      if (tracking_mode_) {
-        // 1. In tracking mode, expand the previous ROI to define the current processing area
-        cv::Rect potential_roi = scale_rect(last_armor_roi_, 2.0, 1.5);
-        // 2. Ensure the ROI does not exceed the image boundaries
-        last_armor_roi_ = potential_roi & cv::Rect(0, 0, frame.cols, frame.rows);
-        
-        processing_frame = frame(last_armor_roi_);
-        roi_offset = last_armor_roi_.tl();
-        
-        // Draw the ROI area on the result image for debugging purposes
-        cv::rectangle(result_frame, last_armor_roi_, cv::Scalar(0, 255, 255), 2);
+  cv::Mat preprocessImage(const cv::Mat& rgb_img)
+  {
+    cv::Mat gray_img, binary_img;
+    cv::cvtColor(rgb_img, gray_img, cv::COLOR_BGR2GRAY);
+    cv::threshold(gray_img, binary_img, binary_thres_, 255, cv::THRESH_BINARY);
+    return binary_img;
+  }
+
+  std::vector<Light> findLights(const cv::Mat& rgb_img, const cv::Mat& binary_img)
+  {
+    std::vector<std::vector<cv::Point>> contours;
+    cv::findContours(binary_img, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+    
+    std::vector<Light> lights;
+    
+    for (const auto& contour : contours) {
+      if (contour.size() < 5) continue;
+      
+      double area = cv::contourArea(contour);
+      if (area < 50 || area > 5000) continue;
+      
+      cv::RotatedRect r_rect = cv::minAreaRect(contour);
+      cv::Rect b_rect = cv::boundingRect(contour);
+      
+      // 计算灯条参数
+      float width = std::min(r_rect.size.width, r_rect.size.height);
+      float length = std::max(r_rect.size.width, r_rect.size.height);
+      float ratio = length / width;
+      
+      // 筛选灯条
+      if (ratio < 1.5f || ratio > 10.0f) continue;
+      
+      // 计算灯条端点
+      cv::Point2f top, bottom;
+      if (r_rect.size.width < r_rect.size.height) {
+        top = cv::Point2f(r_rect.center.x, r_rect.center.y - length/2);
+        bottom = cv::Point2f(r_rect.center.x, r_rect.center.y + length/2);
       } else {
-        // 3. If not in tracking mode, process the entire image
-        processing_frame = frame;
+        top = cv::Point2f(r_rect.center.x - length/2, r_rect.center.y);
+        bottom = cv::Point2f(r_rect.center.x + length/2, r_rect.center.y);
       }
-      // ======================= ROI Logic [End] =======================
+      
+      float angle = r_rect.angle;
+      if (angle > 90.0f) angle = 180.0f - angle;
+      
+      Light light(b_rect, top, bottom, length, width, angle);
+      
+      // 颜色识别
+      if (isValidLight(light, rgb_img, contour)) {
+        lights.push_back(light);
+      }
+    }
+    
+    return lights;
+  }
 
-      // Call the detection function, passing the processing image and the offset
-      vector<RotatedRect> found_armors = detectLightBar(
-          processing_frame, result_frame, msg->header, roi_offset);
-
-      // ======================= Update Tracking State [Start] =======================
-      if (!found_armors.empty()) {
-        // If a target is found
-        tracking_mode_ = true;
-        lost_count_ = 0;
-        // Update the ROI to be the bounding box of the first found armor
-        last_armor_roi_ = found_armors[0].boundingRect();
-        
-        // Draw the found armors
-        for (const auto& armor : found_armors) {
-            Point2f pts[4];
-            armor.points(pts);
-            for (int k = 0; k < 4; k++) {
-                line(result_frame, pts[k], pts[(k + 1) % 4], Scalar(0, 255, 0), 2);
-            }
+  bool isValidLight(const Light& light, const cv::Mat& rgb_img, const std::vector<cv::Point>& contour)
+  {
+    // 角度筛选
+    if (light.tilt_angle > 30.0f) return false;
+    
+    // 长宽比筛选
+    float ratio = light.length / light.width;
+    if (ratio < 2.0f || ratio > 8.0f) return false;
+    
+    // 颜色识别
+    cv::Mat mask = cv::Mat::zeros(light.rect.size(), CV_8UC1);
+    std::vector<cv::Point> mask_contour;
+    for (const auto& p : contour) {
+      mask_contour.emplace_back(p - cv::Point(light.rect.x, light.rect.y));
+    }
+    cv::fillPoly(mask, {mask_contour}, 255);
+    
+    int sum_r = 0, sum_b = 0, count = 0;
+    auto roi = rgb_img(light.rect);
+    
+    for (int i = 0; i < roi.rows; i++) {
+      for (int j = 0; j < roi.cols; j++) {
+        if (mask.at<uchar>(i, j) > 0) {
+          sum_b += roi.at<cv::Vec3b>(i, j)[0]; // Blue channel
+          sum_r += roi.at<cv::Vec3b>(i, j)[2]; // Red channel
+          count++;
         }
-      } else {
-        // If no target is found
-        lost_count_++;
-        // If the target is lost for more than 10 consecutive frames, exit tracking mode and return to full-image search
-        if (lost_count_ > 10) {
-          tracking_mode_ = false;
+      }
+    }
+    
+    if (count == 0) return false;
+    
+    // 根据检测颜色筛选
+    if (detect_color_ == 0) { // RED
+      return sum_r > sum_b * 1.2;
+    } else { // BLUE
+      return sum_b > sum_r * 1.2;
+    }
+  }
+
+  std::vector<Armor> matchLights(const std::vector<Light>& lights)
+  {
+    std::vector<Armor> armors;
+    
+    for (size_t i = 0; i < lights.size(); i++) {
+      for (size_t j = i + 1; j < lights.size(); j++) {
+        const Light& l1 = lights[i];
+        const Light& l2 = lights[j];
+        
+        if (isValidArmor(l1, l2)) {
+          armors.emplace_back(Armor(l1, l2));
         }
       }
-      // ======================= Update Tracking State [End] =======================
+    }
+    
+    return armors;
+  }
 
-      sensor_msgs::msg::Image::SharedPtr result_msg = 
-        cv_bridge::CvImage(msg->header, "bgr8", result_frame).toImageMsg();
-      result_image_pub_.publish(result_msg);
+  bool isValidArmor(const Light& l1, const Light& l2)
+  {
+    // 高度差
+    float height_ratio = std::min(l1.length, l2.length) / std::max(l1.length, l2.length);
+    if (height_ratio < 0.7f) return false;
+    
+    // 距离
+    float distance = cv::norm(l1.center - l2.center);
+    float avg_length = (l1.length + l2.length) / 2.0f;
+    float distance_ratio = distance / avg_length;
+    
+    if (distance_ratio < 1.0f || distance_ratio > 5.0f) return false;
+    
+    // 角度差
+    float angle_diff = std::abs(l1.tilt_angle - l2.tilt_angle);
+    if (angle_diff > 15.0f) return false;
+    
+    // 水平对齐
+    float y_diff = std::abs(l1.center.y - l2.center.y);
+    if (y_diff > avg_length * 0.5f) return false;
+    
+    return true;
+  }
+
+  void publishResult(const cv::Mat& frame, const std::vector<Armor>& armors, const std_msgs::msg::Header& header)
+  {
+    if (result_pub_.getNumSubscribers() == 0) return;
+    
+    cv::Mat result_frame = frame.clone();
+    
+    // 绘制装甲板
+    for (const auto& armor : armors) {
+      cv::line(result_frame, armor.left_light.top, armor.right_light.bottom, cv::Scalar(0, 255, 0), 2);
+      cv::line(result_frame, armor.left_light.bottom, armor.right_light.top, cv::Scalar(0, 255, 0), 2);
       
-    } catch (const cv_bridge::Exception& e) {
-      RCLCPP_ERROR(this->get_logger(), "cv_bridge exception: %s", e.what());
+      // 绘制中心
+      cv::Point2f center = (armor.left_light.center + armor.right_light.center) * 0.5f;
+      cv::circle(result_frame, center, 4, cv::Scalar(0, 0, 255), -1);
+    }
+    
+    auto result_msg = cv_bridge::CvImage(header, "bgr8", result_frame).toImageMsg();
+    result_pub_.publish(result_msg);
+  }
+
+  void logPerformance(const std::chrono::high_resolution_clock::time_point& start_time)
+  {
+    auto end_time = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time);
+    
+    frame_count_++;
+    total_time_ += duration.count();
+    
+    if (frame_count_ >= 30) {
+      double fps = 1000000.0 / (total_time_ / frame_count_);
+      RCLCPP_INFO(this->get_logger(), "Detection FPS: %.1f", fps);
+      frame_count_ = 0;
+      total_time_ = 0;
     }
   }
 
-  // Modified: The function returns a list of found armors and accepts an ROI offset
-  // 修改：函数返回找到的装甲板列表，并接受ROI偏移量
-  vector<RotatedRect> detectLightBar(const Mat& src, Mat &dst_to_draw_on, const std_msgs::msg::Header & header, const cv::Point & offset) {
-      // ======================= 核心修改：采用灰度阈值法 [开始] =======================
-      
-      // 1. 将原图转换为灰度图
-      Mat gray_img;
-      cvtColor(src, gray_img, COLOR_BGR2GRAY);
-
-      // 2. 根据亮度进行二值化
-      // 这个阈值 `binary_thres` 是一个关键参数，需要根据实际场景亮度进行调整。
-      // 可以先从 160 开始尝试。灯条越亮，这个值可以设得越高。
-      Mat binary_img;
-      int binary_thres = 160; 
-      cv::threshold(gray_img, binary_img, binary_thres, 255, cv::THRESH_BINARY);
-      
-      // (可选) HSV方法被注释掉，作为对比保留
-      // Mat hsv;
-      // cvtColor(src, hsv, COLOR_BGR2HSV);
-      // cv::Scalar lower_blue(100, 80, 80);
-      // cv::Scalar upper_blue(130, 255, 255);
-      // cv::inRange(hsv, lower_blue, upper_blue, binary_img);
-
-      // 3. 形态学操作（现在对于更干净的二值图可能需要调整或省略）
-      Mat kernel = getStructuringElement(MORPH_RECT, Size(3, 3));
-      morphologyEx(binary_img, binary_img, MORPH_OPEN, kernel);
-
-      // ======================= 核心修改：采用灰度阈值法 [结束] =======================
-
-
-      if (debug_) {
-        // 发布的调试图像现在是基于灰度阈值的结果
-        auto mask_msg = cv_bridge::CvImage(header, "mono8", binary_img).toImageMsg();
-        binary_mask_pub_.publish(std::move(mask_msg));
-      }
-
-      // 4. 寻找轮廓 (后续逻辑保持不变)
-      vector<vector<Point>> contours;
-      findContours(binary_img, contours, RETR_EXTERNAL, CHAIN_APPROX_SIMPLE);
-
-      // 5. 筛选灯条
-      vector<RotatedRect> lightBars;
-      for (const auto& cont : contours) {
-        double area = contourArea(cont);
-        if (area < 15 || area > 500) continue;
-        if (cont.size() < 5) continue;
-        
-        RotatedRect r = minAreaRect(cont);
-        float longSide = max(r.size.width, r.size.height);
-        float shortSide = min(r.size.width, r.size.height);
-        if (shortSide < 1e-5) continue;
-        
-        float ratio = longSide / shortSide;
-        if (ratio < 1.5 || ratio > 10.0) continue;
-        
-        lightBars.push_back(r);
-      }
-      
-      vector<RotatedRect> found_armors; // 存储本函数找到的装甲板
-
-      // 6. 配对灯条
-      for (size_t i = 0; i < lightBars.size(); i++) {
-          for (size_t j = i + 1; j < lightBars.size(); j++) {
-              float angle_i = normalizedAngle(lightBars[i]);
-              float angle_j = normalizedAngle(lightBars[j]);
-              if (fabs(angle_i - angle_j) > 10.0) continue;
-              
-              float height_i = max(lightBars[i].size.width, lightBars[i].size.height);
-              float height_j = max(lightBars[j].size.width, lightBars[j].size.height);
-              if (fabs(height_i - height_j) / max(height_i, height_j) > 0.2) continue;
-              
-              Point2f center_diff = lightBars[i].center - lightBars[j].center;
-              float distance = sqrt(center_diff.ddot(center_diff));
-              float avg_height = (height_i + height_j) * 0.5;
-              if(distance / avg_height < 1.0 || distance / avg_height > 5.0) continue;
-              
-              RotatedRect armorRect = RotatedRect(
-                  (lightBars[i].center + lightBars[j].center) * 0.5f,
-                  Size2f(distance, avg_height), 
-                  (angle_i + angle_j) * 0.5f
-              );
-              
-              // 将ROI内的坐标转换回全图坐标
-              armorRect.center.x += offset.x;
-              armorRect.center.y += offset.y;
-
-              found_armors.push_back(armorRect);
-          }
-      }
-      
-      // 返回找到的装甲板列表
-      return found_armors;
-  }
-
-  static float normalizedAngle(const RotatedRect& r) {
-      float w = r.size.width, h = r.size.height, ang = r.angle;
-      if (w < h) ang += 90.0f;
-      if (ang >= 180.0f) ang -= 180.0f;
-      return ang;
-  }
-
-  void createDebugPublishers() {
-    if (!binary_mask_pub_) {
-      binary_mask_pub_ = image_transport::create_publisher(this, "armor_detector/binary_mask");
-      RCLCPP_INFO(this->get_logger(), "Debug mode enabled. Publishing binary mask topic.");
-    }
-  }
-
-  void destroyDebugPublishers() {
-    if (binary_mask_pub_) {
-      binary_mask_pub_.shutdown();
-      binary_mask_pub_ = {}; 
-      RCLCPP_INFO(this->get_logger(), "Debug mode disabled. Stopped publishing binary mask topic.");
-    }
-  }
-
-  // Member variables
   image_transport::Subscriber subscription_;
-  image_transport::Publisher result_image_pub_;
+  image_transport::Publisher result_pub_;
   
+  int binary_thres_;
+  int detect_color_;
   bool debug_;
-  image_transport::Publisher binary_mask_pub_;
-  std::shared_ptr<rclcpp::ParameterEventHandler> param_subscriber_;
-  std::shared_ptr<rclcpp::ParameterCallbackHandle> param_callback_handle_;
-
-  // State variables for ROI tracking
-  bool tracking_mode_ = false;  // Is it in tracking mode?
-  cv::Rect last_armor_roi_;     // ROI of the armor from the previous frame
-  int lost_count_ = 0;          // Frame count of consecutive target loss
+  
+  int frame_count_ = 0;
+  long long total_time_ = 0;
 };
 
 int main(int argc, char * argv[])
 {
   rclcpp::init(argc, argv);
-  rclcpp::spin(std::make_shared<ArmorDetectorNode>());
+  rclcpp::spin(std::make_shared<FastArmorDetector>());
   rclcpp::shutdown();
   return 0;
 }
