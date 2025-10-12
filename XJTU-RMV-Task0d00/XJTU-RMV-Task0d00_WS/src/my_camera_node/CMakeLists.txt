@@ -1,6 +1,10 @@
 cmake_minimum_required(VERSION 3.8)
 project(my_camera_node)
 
+if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -w")
+endif()
+
 # 使用 C++17 标准
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -58,18 +62,7 @@ target_link_libraries(armor_detector_node
   ${OpenCV_LIBS}
 )
 
-
-# --- 3. 构建视频发布节点 (作为独立可执行文件) ---
-# 同样，为视频发布节点创建一个可执行文件
-ament_auto_add_executable(video_publisher_node
-  src/video_publisher_node.cpp
-)
-# 也为它链接OpenCV库
-target_link_libraries(video_publisher_node
-  ${OpenCV_LIBS}
-)
-
-# --- 4. 构建三合一相机节点 (作为独立可执行文件) ---
+# --- 3. 构建三合一相机节点 (作为独立可执行文件) ---
 ament_auto_add_executable(multi_source_camera_node
   src/multi_source_camera_node.cpp
 )
