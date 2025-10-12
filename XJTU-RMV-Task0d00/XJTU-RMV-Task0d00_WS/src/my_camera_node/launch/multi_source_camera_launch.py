@@ -7,7 +7,7 @@ def generate_launch_description():
     # ===== 相机节点参数 =====
     source_mode_arg = DeclareLaunchArgument(
         "source_mode",
-        default_value="video_file",
+        default_value="usb_camera",
         description="视频源模式: 'video_file' 或 'usb_camera'"
     )
 
@@ -25,7 +25,7 @@ def generate_launch_description():
 
     frame_rate_arg = DeclareLaunchArgument(
         "frame_rate",
-        default_value="30.0",
+        default_value="60.0",
         description="帧率设置"
     )
 
