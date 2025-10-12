@@ -30,6 +30,7 @@ public:
     result_pub_ = image_transport::create_publisher(this, "armor_detector/result", qos.get_rmw_qos_profile());
     binary_pub_ = image_transport::create_publisher(this, "armor_detector/binary_mask", qos.get_rmw_qos_profile());
     lights_pub_ = image_transport::create_publisher(this, "armor_detector/lights", qos.get_rmw_qos_profile());
+    bbox_pub_ = image_transport::create_publisher(this, "armor_detector/bounding_boxes", qos.get_rmw_qos_profile()); // 新增：外接矩形可视化
     
     // 参数
     this->declare_parameter("binary_thres", 180);
@@ -59,14 +60,16 @@ public:
 private:
   struct Light {
     cv::RotatedRect rect;
+    cv::Rect bbox;  // 新增：外接矩形
     cv::Point2f top, bottom;
     double length;
     double width;
     cv::Point2f center;
     float tilt_angle;
     int color;
+    double area;    // 新增：轮廓面积
     
-    Light(cv::RotatedRect r) : rect(r) {
+    Light(cv::RotatedRect r, cv::Rect b, double a) : rect(r), bbox(b), area(a) {
       width = min(r.size.width, r.size.height);
       length = max(r.size.width, r.size.height);
       center = r.center;
@@ -103,6 +106,9 @@ private:
       // 查找灯条
       std::vector<Light> lights = findLights(binary_img);
       
+      // 发布外接矩形可视化
+      publishBoundingBoxes(frame, lights, msg->header);
+      
       // 发布灯条可视化结果
       publishLightVisualization(frame, lights, msg->header);
       
@@ -133,6 +139,7 @@ private:
     // 形态学操作去噪
     cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, 3));
     cv::morphologyEx(binary, binary, cv::MORPH_OPEN, kernel);
+    cv::morphologyEx(binary, binary, cv::MORPH_CLOSE, kernel);
     
     return binary;
   }
@@ -149,6 +156,8 @@ private:
       if (area < min_contour_area_ || area > max_contour_area_) continue;
       
       cv::RotatedRect rect = cv::minAreaRect(contour);
+      cv::Rect bbox = cv::boundingRect(contour);  // 计算外接矩形
+      
       float width = min(rect.size.width, rect.size.height);
       float length = max(rect.size.width, rect.size.height);
       
@@ -163,10 +172,56 @@ private:
       if (angle > 90.0f) angle = 180.0f - angle;
       if (angle > 30.0f) continue;
       
-      lights.emplace_back(rect);
+      lights.emplace_back(rect, bbox, area);
     }
     
     return lights;
+  }
+
+  // 新增：发布外接矩形可视化
+  void publishBoundingBoxes(const cv::Mat& frame, const std::vector<Light>& lights, const std_msgs::msg::Header& header)
+  {
+    if (bbox_pub_.getNumSubscribers() == 0) return;
+    
+    cv::Mat bbox_frame = frame.clone();
+    
+    for (const auto& light : lights) {
+      // 绘制外接矩形（蓝色）
+      cv::rectangle(bbox_frame, light.bbox, cv::Scalar(255, 0, 0), 2);
+      
+      // 绘制最小外接矩形（绿色）
+      cv::Point2f vertices[4];
+      light.rect.points(vertices);
+      for (int i = 0; i < 4; i++) {
+        cv::line(bbox_frame, vertices[i], vertices[(i + 1) % 4], cv::Scalar(0, 255, 0), 2);
+      }
+      
+      // 显示轮廓信息
+      std::string info = "A:" + std::to_string((int)light.area);
+      cv::putText(bbox_frame, info, 
+                  cv::Point(light.bbox.x, light.bbox.y - 5), 
+                  cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255, 255, 255), 1);
+      
+      // 显示长宽比
+      std::string ratio_info = "R:" + std::to_string((int)(light.length/light.width));
+      cv::putText(bbox_frame, ratio_info, 
+                  cv::Point(light.bbox.x, light.bbox.y + light.bbox.height + 15), 
+                  cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255, 255, 255), 1);
+    }
+    
+    // 添加统计信息
+    std::string count_info = "Contours: " + std::to_string(lights.size());
+    cv::putText(bbox_frame, count_info, cv::Point(10, 30), 
+                cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(255, 255, 255), 2);
+    
+    // 添加图例
+    cv::putText(bbox_frame, "Blue: Bounding Rect", cv::Point(10, 60), 
+                cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(255, 0, 0), 2);
+    cv::putText(bbox_frame, "Green: Min Area Rect", cv::Point(10, 85), 
+                cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 255, 0), 2);
+    
+    auto bbox_msg = cv_bridge::CvImage(header, "bgr8", bbox_frame).toImageMsg();
+    bbox_pub_.publish(bbox_msg);
   }
 
   std::vector<std::pair<Light, Light>> matchLights(const std::vector<Light>& lights)
@@ -325,6 +380,7 @@ private:
   image_transport::Publisher result_pub_;
   image_transport::Publisher binary_pub_;
   image_transport::Publisher lights_pub_;
+  image_transport::Publisher bbox_pub_;  // 新增：外接矩形发布器
   
   // 参数
   int binary_thres_;
