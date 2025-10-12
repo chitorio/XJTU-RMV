@@ -1,5 +1,6 @@
 #include <memory>
 #include <opencv2/imgproc.hpp>
+#include <rclcpp/qos.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/image_encodings.hpp>
 #include <sensor_msgs/msg/image.hpp>
@@ -123,6 +124,11 @@ private:
   // ============================ 核心处理流程 ============================
   void detectCallback(const sensor_msgs::msg::Image::ConstSharedPtr& msg)
   {
+    if (msg->header.stamp == last_frame_stamp_) {
+      return;
+    }
+    last_frame_stamp_ = msg->header.stamp;
+    
     auto start_time = std::chrono::high_resolution_clock::now();
     
     try {
@@ -299,6 +305,8 @@ private:
   
   int frame_count_ = 0;
   long long total_time_ = 0;
+
+  builtin_interfaces::msg::Time last_frame_stamp_;
 };
 
 int main(int argc, char * argv[])

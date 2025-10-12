@@ -7,32 +7,40 @@ def generate_launch_description():
     # ===== 相机节点参数 =====
     source_mode_arg = DeclareLaunchArgument(
         "source_mode",
-        default_value="usb_camera",
-        description="视频源模式: 'video_file' 或 'usb_camera'"
+        default_value="hik_camera",
+        description="视频源模式: 'hik_camera' 或 'video_file'"
     )
 
     video_path_arg = DeclareLaunchArgument(
         "video_path",
         default_value="/home/zoot/Downloads/blue.mp4",
-        description="视频文件路径"
+        description="视频文件路径（video_file模式使用）"
     )
 
-    camera_id_arg = DeclareLaunchArgument(
-        "camera_id",
-        default_value="0",
-        description="USB 相机 ID"
+    # 海康相机参数
+    camera_ip_arg = DeclareLaunchArgument(
+        "camera_ip",
+        default_value="",
+        description="海康相机IP地址（hik_camera模式使用）"
     )
 
+    camera_serial_arg = DeclareLaunchArgument(
+        "camera_serial",
+        default_value="",
+        description="海康相机序列号（hik_camera模式使用）"
+    )
+
+    # 通用参数
     frame_rate_arg = DeclareLaunchArgument(
         "frame_rate",
-        default_value="60.0",
+        default_value="120.0",
         description="帧率设置"
     )
 
     loop_video_arg = DeclareLaunchArgument(
         "loop_video",
         default_value="true",
-        description="是否循环播放视频"
+        description="是否循环播放视频（video_file模式）"
     )
 
     resize_arg = DeclareLaunchArgument(
@@ -53,16 +61,17 @@ def generate_launch_description():
         description="缩放后的高度"
     )
 
-    use_thread_arg = DeclareLaunchArgument(
-        "use_thread",
-        default_value="true",
-        description="是否使用多线程模式（更高性能）"
+    # 海康相机控制参数
+    exposure_time_arg = DeclareLaunchArgument(
+        "exposure_time",
+        default_value="8000.0",
+        description="曝光时间（hik_camera模式）"
     )
 
-    use_hw_accel_arg = DeclareLaunchArgument(
-        "use_hw_accel", 
-        default_value="true",
-        description="是否启用硬件加速"
+    gain_arg = DeclareLaunchArgument(
+        "gain",
+        default_value="10.0",
+        description="增益（hik_camera模式）"
     )
 
     # ===== 装甲板检测节点参数 =====
@@ -81,19 +90,7 @@ def generate_launch_description():
     debug_mode_arg = DeclareLaunchArgument(
         "debug_mode",
         default_value="true",
-        description="是否开启调试模式（显示更多信息）"
-    )
-
-    min_contour_area_arg = DeclareLaunchArgument(
-        "min_contour_area",
-        default_value="50",
-        description="最小轮廓面积"
-    )
-
-    max_contour_area_arg = DeclareLaunchArgument(
-        "max_contour_area",
-        default_value="3000", 
-        description="最大轮廓面积"
+        description="是否开启调试模式"
     )
 
     # ===== 创建节点 =====
@@ -105,14 +102,15 @@ def generate_launch_description():
         parameters=[{
             "source_mode": LaunchConfiguration("source_mode"),
             "video_path": LaunchConfiguration("video_path"),
-            "camera_id": LaunchConfiguration("camera_id"),
+            "camera_ip": LaunchConfiguration("camera_ip"),
+            "camera_serial": LaunchConfiguration("camera_serial"),
             "frame_rate": LaunchConfiguration("frame_rate"),
             "loop_video": LaunchConfiguration("loop_video"),
             "resize": LaunchConfiguration("resize"),
             "resize_width": LaunchConfiguration("resize_width"),
             "resize_height": LaunchConfiguration("resize_height"),
-            "use_thread": LaunchConfiguration("use_thread"),
-            "use_hw_accel": LaunchConfiguration("use_hw_accel"),
+            "exposure_time": LaunchConfiguration("exposure_time"),
+            "gain": LaunchConfiguration("gain"),
         }]
     )
 
@@ -125,8 +123,6 @@ def generate_launch_description():
             "binary_thres": LaunchConfiguration("detector_thres"),
             "detect_color": LaunchConfiguration("detect_color"),
             "debug": LaunchConfiguration("debug_mode"),
-            "min_contour_area": LaunchConfiguration("min_contour_area"),
-            "max_contour_area": LaunchConfiguration("max_contour_area"),
         }]
     )
 
@@ -134,21 +130,20 @@ def generate_launch_description():
         # 相机参数
         source_mode_arg,
         video_path_arg,
-        camera_id_arg,
+        camera_ip_arg,
+        camera_serial_arg,
         frame_rate_arg,
         loop_video_arg,
         resize_arg,
         resize_width_arg,
         resize_height_arg,
-        use_thread_arg,
-        use_hw_accel_arg,
+        exposure_time_arg,
+        gain_arg,
         
         # 检测器参数
         detector_thres_arg,
         detect_color_arg,
         debug_mode_arg,
-        min_contour_area_arg,
-        max_contour_area_arg,
         
         # 节点
         camera_node,
