@@ -13,7 +13,7 @@ def generate_launch_description():
 
     video_path_arg = DeclareLaunchArgument(
         "video_path",
-        default_value="/home/zoot/Desktop/test.mp4",  # ⚙️ 修改成你的视频路径
+        default_value="/home/zoot/Downloads/blue.mp4",
         description="视频文件路径"
     )
 
@@ -53,10 +53,22 @@ def generate_launch_description():
         description="缩放后的高度"
     )
 
+    use_thread_arg = DeclareLaunchArgument(
+        "use_thread",
+        default_value="true",
+        description="是否使用多线程模式（更高性能）"
+    )
+
+    use_hw_accel_arg = DeclareLaunchArgument(
+        "use_hw_accel", 
+        default_value="true",
+        description="是否启用硬件加速"
+    )
+
     # 创建节点
     camera_node = Node(
-        package="my_camera_node",  # ⚙️ 改成你包的名字
-        executable="multi_source_camera_node",  # 你编译后的可执行文件名
+        package="my_camera_node",
+        executable="multi_source_camera_node",
         name="multi_source_camera_node",
         output="screen",
         parameters=[{
@@ -68,6 +80,8 @@ def generate_launch_description():
             "resize": LaunchConfiguration("resize"),
             "resize_width": LaunchConfiguration("resize_width"),
             "resize_height": LaunchConfiguration("resize_height"),
+            "use_thread": LaunchConfiguration("use_thread"),
+            "use_hw_accel": LaunchConfiguration("use_hw_accel"),
         }]
     )
 
@@ -80,5 +94,7 @@ def generate_launch_description():
         resize_arg,
         resize_width_arg,
         resize_height_arg,
+        use_thread_arg,
+        use_hw_accel_arg,
         camera_node
     ])
