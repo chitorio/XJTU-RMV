@@ -38,7 +38,7 @@ public:
     this->declare_parameter("min_contour_area", 50);
     this->declare_parameter("max_contour_area", 3000);
     this->declare_parameter("min_lightbar_ratio", 2.0);
-    this->declare_parameter("max_lightbar_ratio", 8.0);
+    this->declare_parameter("max_lightbar_ratio", 50.0);
     this->declare_parameter("max_angle_diff", 15.0);
     this->declare_parameter("max_height_diff", 0.3);
     
