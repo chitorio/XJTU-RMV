@@ -43,7 +43,7 @@ public:
     this->declare_parameter("detect_color", 1); // 0: RED, 1: BLUE
     this->declare_parameter("debug", true);
     this->declare_parameter("min_contour_area", 20);
-    this->declare_parameter("max_contour_area", 3000);
+    this->declare_parameter("max_contour_area", 6000);
     this->declare_parameter("min_lightbar_ratio", 1.5);
     this->declare_parameter("max_lightbar_ratio", 15.0);
     this->declare_parameter("max_angle_diff", 30.0);  // 放宽角度差到30度
