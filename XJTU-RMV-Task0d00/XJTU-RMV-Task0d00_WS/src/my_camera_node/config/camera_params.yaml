@@ -11,12 +11,12 @@
     # 微秒, 这是您需要根据现场光照环境调整的最重要参数！
     # 如果画面太暗，就调大这个值 (e.g., 15000)
     # 如果画面太亮或有拖影，就调小这个值
-    exposure_time: 8000.0
+    exposure_time: 25000.0
 
     # 必须为 false, 关闭自动增益
     auto_gain: false
     # dB, 亮度不足时可作为辅助调节，但会增加噪声
-    gain: 10.0
+    gain: 16.0
 
     # --- 图像采集与发布参数 ---
     # 帧率 (Hz)，请确保您的相机支持此帧率
@@ -29,9 +29,9 @@
     height: 480
 
     # 像素格式，bgr8 表示直接输出彩色图像
-    pixel_format: "bgr8"
+    pixel_format: "bayar_rg8" # "bgr8" or "mono8" or "bayar_rg8"
     
-    # 相机标定文件路径 (已修正包名)
+    # 相机标定文件路径
     camera_info_url: "package://my_camera_node/config/camera_info.yaml"
     
     # --- 备用：视频文件模式参数 ---

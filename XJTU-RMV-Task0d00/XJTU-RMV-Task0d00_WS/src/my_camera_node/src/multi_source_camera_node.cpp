@@ -58,13 +58,13 @@ private:
     this->declare_parameter("use_sensor_data_qos", true);
     this->declare_parameter("camera_name", "camera");
     this->declare_parameter("camera_info_url", "");
-    this->declare_parameter("frame_rate", 30.0);
-    this->declare_parameter("resize", true);
+    this->declare_parameter("frame_rate", 120.0);
+    this->declare_parameter("resize", false);
     this->declare_parameter("width", 640);
     this->declare_parameter("height", 480);
     this->declare_parameter("pixel_format", "bgr8");
     this->declare_parameter("exposure_time", 10000.0);
-    this->declare_parameter("gain", 0.0);
+    this->declare_parameter("gain", 10.0);
     this->declare_parameter("auto_exposure", false);
     this->declare_parameter("auto_gain", false);
     this->declare_parameter("reconnect_interval", 2.0);
@@ -140,16 +140,7 @@ private:
     double exposure_time = this->get_parameter("exposure_time").as_double();
     double gain = this->get_parameter("gain").as_double();
     
-    // ================== 关键修复：注释掉设置相机分辨率的代码 ==================
     // 让相机使用默认的最大分辨率进行采集，以获取完整视野
-    // int width = this->get_parameter("width").as_int();
-    // int height = this->get_parameter("height").as_int();
-    // if (width > 0 && height > 0) {
-    //   MV_CC_SetIntValueEx(hik_camera_handle_, "Width", static_cast<int64_t>(width));
-    //   MV_CC_SetIntValueEx(hik_camera_handle_, "Height", static_cast<int64_t>(height));
-    // }
-    // =======================================================================
-    
     MV_CC_SetEnumValue(hik_camera_handle_, "TriggerMode", 0);
     MV_CC_SetEnumValue(hik_camera_handle_, "ExposureAuto", this->get_parameter("auto_exposure").as_bool() ? 1 : 0);
     MV_CC_SetFloatValue(hik_camera_handle_, "ExposureTime", exposure_time);
@@ -186,11 +177,21 @@ private:
 
   void startCaptureThread()
   {
+    // 创建图像发布器
     camera_pub_ = image_transport::create_camera_publisher(this, this->get_parameter("image_topic").as_string(), rclcpp::SensorDataQoS().get_rmw_qos_profile());
+    
+    // 创建camera_info发布器 - 新增！
+    camera_info_pub_ = this->create_publisher<sensor_msgs::msg::CameraInfo>("camera_info", rclcpp::SensorDataQoS());
+    
+    // 初始化相机信息管理器
     camera_info_manager_ = std::make_unique<camera_info_manager::CameraInfoManager>(this, this->get_parameter("camera_name").as_string(), this->get_parameter("camera_info_url").as_string());
+    
     if(camera_info_manager_->loadCameraInfo(this->get_parameter("camera_info_url").as_string())) {
         RCLCPP_INFO(this->get_logger(), "Camera info loaded successfully.");
+    } else {
+        RCLCPP_WARN(this->get_logger(), "Failed to load camera info from: %s", this->get_parameter("camera_info_url").as_string().c_str());
     }
+    
     capture_thread_ = std::thread(&MultiSourceCameraNode::captureImages, this);
   }
 
@@ -256,9 +257,16 @@ private:
     auto msg = cv_bridge::CvImage(std_msgs::msg::Header(), "bgr8", frame).toImageMsg();
     msg->header.stamp = this->now();
     msg->header.frame_id = this->get_parameter("frame_id").as_string();
+    
+    // 获取camera_info并发布 - 新增！
     auto camera_info_msg = std::make_shared<sensor_msgs::msg::CameraInfo>(camera_info_manager_->getCameraInfo());
     camera_info_msg->header = msg->header;
-    camera_pub_.publish(std::move(msg), std::move(camera_info_msg));
+    
+    // 发布图像和camera_info
+    camera_pub_.publish(std::move(msg), camera_info_msg);
+    
+    // 单独发布camera_info话题 - 新增！
+    camera_info_pub_->publish(*camera_info_msg);
   }
 
   std::string source_mode_;
@@ -269,6 +277,7 @@ private:
   std::thread camera_manager_thread_;
   std::thread capture_thread_;
   image_transport::CameraPublisher camera_pub_;
+  rclcpp::Publisher<sensor_msgs::msg::CameraInfo>::SharedPtr camera_info_pub_; // 新增！
   std::unique_ptr<camera_info_manager::CameraInfoManager> camera_info_manager_;
 };
 
