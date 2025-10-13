@@ -1,26 +1,43 @@
 /**:
   ros__parameters:
-    # 相机识别信息（可选）
-    camera_sn: ""             # 可填序列号，例如 "KE01012345"；留空则自动使用第一个USB相机
-    camera_ip: ""             # 仅GigE相机使用，USB可留空
+    # --- 关键模式设置 ---
+    # 可选: "hik_camera" 或 "video_file"
+    # 这个值可以被 launch 文件或命令行覆盖
+    source_mode: "hik_camera"
 
-    # 基本采集参数
-    exposure_time: 8000.0    # 微秒，亮度不足时可适当加大 (范围 100-1000000)
-    gain: 10.0                # dB，调大画面更亮但噪声增加
-    frame_rate: 160.0          # 帧率 Hz
-    pixel_format: "BGR8"      # 可选: "BGR8" 或 "Mono8" 或 "Bayer_RG_8"
+    # --- 关键相机控制参数 (手动模式) ---
+    # 必须为 false, 关闭自动曝光以保证图像亮度稳定
+    auto_exposure: false
+    # 微秒, 这是您需要根据现场光照环境调整的最重要参数！
+    # 如果画面太暗，就调大这个值 (e.g., 15000)
+    # 如果画面太亮或有拖影，就调小这个值
+    exposure_time: 8000.0
 
-    # 分辨率设置（需符合相机支持的值）
+    # 必须为 false, 关闭自动增益
+    auto_gain: false
+    # dB, 亮度不足时可作为辅助调节，但会增加噪声
+    gain: 10.0
+
+    # --- 图像采集与发布参数 ---
+    # 帧率 (Hz)，请确保您的相机支持此帧率
+    frame_rate: 120.0
+
+    # 最终发布到ROS话题的图像尺寸
+    # 节点会先采集相机原始分辨率，然后缩放到这个尺寸
+    resize: false
     width: 640
     height: 480
 
-    # 发布设置
-    image_topic: "/image_raw"
-    use_sensor_data_qos: true
-
-    # 相机标定文件（可选）
+    # 像素格式，bgr8 表示直接输出彩色图像
+    pixel_format: "bgr8"
+    
+    # 相机标定文件路径 (已修正包名)
     camera_info_url: "package://my_camera_node/config/camera_info.yaml"
+    
+    # --- 备用：视频文件模式参数 ---
+    video_path: "/home/zoot/Downloads/blue.mp4" # 您的视频文件路径
+    loop_video: true
 
-    # 断线重连策略
-    reconnect_interval_sec: 2
-    max_reconnect_attempts: 0    # 0 表示无限重试
+    # --- 可选：相机识别信息 ---
+    camera_sn: ""  # 序列号
+    camera_ip: ""  # IP地址
