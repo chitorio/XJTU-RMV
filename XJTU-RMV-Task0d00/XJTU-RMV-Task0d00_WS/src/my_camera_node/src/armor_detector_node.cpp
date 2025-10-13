@@ -226,8 +226,8 @@ private:
     float angle_diff = abs(l1.tilt_angle - l2.tilt_angle);
     if (angle_diff > max_angle_diff_) return false;
     
-    float y_diff = abs(l1.center.y - l2.center.y);
-    if (y_diff > avg_length * max_height_diff_ratio_) return false;
+    // float y_diff = abs(l1.center.y - l2.center.y);
+    // if (y_diff > avg_length * max_height_diff_ratio_) return false;
     
     return true;
   }
@@ -288,8 +288,8 @@ private:
     frame_count_++;
     total_time_ += duration.count();
     if (frame_count_ >= 30) {
-      double fps = 1000000.0 / (total_time_ / frame_count_);
-      RCLCPP_INFO(this->get_logger(), "FPS: %.1f, Lights Found: %d, Armors Found: %d", fps, light_count, armor_count);
+      // 只显示检测结果统计，不显示FPS
+      RCLCPP_INFO(this->get_logger(), "Lights Found: %d, Armors Found: %d", light_count, armor_count);
       frame_count_ = 0;
       total_time_ = 0;
     }
