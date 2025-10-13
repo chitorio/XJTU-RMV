@@ -17,6 +17,10 @@ class ArmorDetectorNode : public rclcpp::Node
 public:
   ArmorDetectorNode() : Node("armor_detector_node")
   {
+    // 初始化时间戳
+    last_frame_stamp_.sec = 0;
+    last_frame_stamp_.nanosec = 0;
+    
     // 高性能QoS
     auto qos = rclcpp::QoS(rclcpp::KeepLast(1)).best_effort();
     
@@ -40,12 +44,14 @@ public:
     this->declare_parameter("debug", true);
     this->declare_parameter("min_contour_area", 20);
     this->declare_parameter("max_contour_area", 3000);
-    this->declare_parameter("min_lightbar_ratio", 1.0);
-    this->declare_parameter("max_lightbar_ratio", 20.0);
-    this->declare_parameter("max_angle_diff", 10.0);
-    this->declare_parameter("max_height_diff_ratio", 0.8); // 使用比例代替绝对值
-    
-    // 加载参数 (可以放在回调中实时更新，但为简化先在构造时加载)
+    this->declare_parameter("min_lightbar_ratio", 1.5);
+    this->declare_parameter("max_lightbar_ratio", 15.0);
+    this->declare_parameter("max_angle_diff", 30.0);  // 放宽角度差到30度
+    this->declare_parameter("max_height_diff_ratio", 0.7);  // 放宽高度差比例
+    this->declare_parameter("max_tilt_angle", 60.0);  // 放宽最大倾斜角度到60度
+    this->declare_parameter("armor_height_extension", 0.3);  // 新增：装甲板高度延伸比例
+
+    // 加载参数
     binary_thres_ = this->get_parameter("binary_thres").as_int();
     detect_color_ = this->get_parameter("detect_color").as_int();
     debug_ = this->get_parameter("debug").as_bool();
@@ -55,76 +61,64 @@ public:
     max_lightbar_ratio_ = this->get_parameter("max_lightbar_ratio").as_double();
     max_angle_diff_ = this->get_parameter("max_angle_diff").as_double();
     max_height_diff_ratio_ = this->get_parameter("max_height_diff_ratio").as_double();
+    max_tilt_angle_ = this->get_parameter("max_tilt_angle").as_double();
+    armor_height_extension_ = this->get_parameter("armor_height_extension").as_double();
 
     RCLCPP_INFO(this->get_logger(), "Armor Detector started - Color: %s", detect_color_ == 0 ? "RED" : "BLUE");
   }
 
 private:
-  // ============================ 关键数据结构 ============================
   struct Light {
-    cv::RotatedRect rect;       // 原始最小外接矩形
-    cv::Rect bbox;              // 垂直外接矩形
-    cv::Point2f top, bottom;    // 灯条上下端点
-    double length;              // 灯条长度 (归一化后)
-    double width;               // 灯条宽度 (归一化后)
-    cv::Point2f center;         // 中心点
-    float tilt_angle;           // 与垂直方向的锐角 [0, 90)
-    int color;                  // 颜色 (暂未实现)
-    double area;                // 轮廓面积
+    cv::RotatedRect rect;
+    cv::Rect bbox;
+    cv::Point2f top, bottom;
+    double length;
+    double width;
+    cv::Point2f center;
+    float tilt_angle;  // 与水平方向的夹角 [-90, 90]
+    int color;
+    double area;
     
-    // 构造函数：在此完成所有角度和尺寸的归一化，确保数据一致性
     Light(cv::RotatedRect r, cv::Rect b, double a) : rect(r), bbox(b), area(a) {
       center = r.center;
       
-      // 1. 保证 height 是长边, width 是短边
+      // 修复角度计算：使用OpenCV的标准角度定义
+      // OpenCV的minAreaRect角度范围是[-90, 0)，0度是水平的
+      width = r.size.width;
+      length = r.size.height;
+      tilt_angle = r.angle;
+      
+      // 如果宽度大于高度，说明矩形是横向的，需要调整
       if (r.size.width > r.size.height) {
-        length = r.size.width;
         width = r.size.height;
+        length = r.size.width;
         tilt_angle = r.angle + 90.0f;
-      } else {
-        length = r.size.height;
-        width = r.size.width;
-        tilt_angle = r.angle;
       }
       
-      // 2. 将角度归一化为与垂直Y轴的锐角 [0, 45] 度
-      // OpenCV角度范围是[-90, 0)，-90为垂直
-      // 我们想要的是灯条与垂直方向的夹角
-      tilt_angle = std::abs(90 + tilt_angle); // 转换为与垂直方向的角度
-      if (tilt_angle > 90) {
-        tilt_angle = 180 - tilt_angle;
-      }
-
-      // 3. 鲁棒地计算上下端点
-      cv::Point2f vertices[4];
-      r.points(vertices);
-      float max_dist = 0;
-      int p1_idx = -1, p2_idx = -1;
-      for (int i=0; i<4; ++i) {
-          for (int j=i+1; j<4; ++j) {
-              float d = cv::norm(vertices[i] - vertices[j]);
-              if (d > max_dist) {
-                  max_dist = d;
-                  p1_idx = i;
-                  p2_idx = j;
-              }
-          }
-      }
-      // 保证 top 在 bottom 的上方 (y值更小)
-      if (vertices[p1_idx].y < vertices[p2_idx].y) {
-          top = vertices[p1_idx];
-          bottom = vertices[p2_idx];
-      } else {
-          top = vertices[p2_idx];
-          bottom = vertices[p1_idx];
+      // 将角度归一化到 [-90, 90] 范围
+      while (tilt_angle > 90.0f) tilt_angle -= 180.0f;
+      while (tilt_angle < -90.0f) tilt_angle += 180.0f;
+      
+      // 计算端点 - 更简单直接的方法
+      float angle_rad = tilt_angle * CV_PI / 180.0f;
+      float dx = length * 0.5f * std::cos(angle_rad);
+      float dy = length * 0.5f * std::sin(angle_rad);
+      
+      top = cv::Point2f(center.x - dx, center.y - dy);
+      bottom = cv::Point2f(center.x + dx, center.y + dy);
+      
+      // 确保top在bottom上方
+      if (top.y > bottom.y) {
+        std::swap(top, bottom);
       }
     }
   };
 
-  // ============================ 核心处理流程 ============================
   void detectCallback(const sensor_msgs::msg::Image::ConstSharedPtr& msg)
   {
-    if (msg->header.stamp == last_frame_stamp_) {
+    // 时间戳去重
+    if (msg->header.stamp.sec == last_frame_stamp_.sec && 
+        msg->header.stamp.nanosec == last_frame_stamp_.nanosec) {
       return;
     }
     last_frame_stamp_ = msg->header.stamp;
@@ -139,7 +133,7 @@ private:
       std::vector<Light> lights = findLights(binary_img);
       std::vector<std::pair<Light, Light>> armors = matchLights(lights);
       
-      // 只有在开启debug模式时才发布调试图像
+      // 调试信息发布
       if (debug_) {
         publishBoundingBoxes(frame, lights, msg->header);
         publishLightVisualization(frame, lights, msg->header);
@@ -157,16 +151,14 @@ private:
     }
   }
 
-  // ============================ 算法实现 ============================
   cv::Mat preprocessImage(const cv::Mat& rgb_img)
   {
     cv::Mat gray, binary;
     cv::cvtColor(rgb_img, gray, cv::COLOR_BGR2GRAY);
     cv::threshold(gray, binary, binary_thres_, 255, cv::THRESH_BINARY);
     
-    // 开闭操作
+    // 形态学操作
     cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, 3));
-    cv::morphologyEx(binary, binary, cv::MORPH_OPEN, kernel);
     cv::morphologyEx(binary, binary, cv::MORPH_OPEN, kernel);
     
     return binary;
@@ -187,8 +179,10 @@ private:
       
       Light light(rect, bbox, area);
       
-      if (light.tilt_angle > 30.0f) continue;
+      // 放宽倾斜角度限制
+      if (std::abs(light.tilt_angle) > max_tilt_angle_) continue;
       if (light.width < 1e-5) continue;
+      
       float ratio = light.length / light.width;
       if (ratio < min_lightbar_ratio_ || ratio > max_lightbar_ratio_) continue;
       
@@ -216,23 +210,33 @@ private:
   {
     float avg_length = (l1.length + l2.length) * 0.5f;
 
-    float height_ratio = min(l1.length, l2.length) / max(l1.length, l2.length);
-    if (height_ratio < 0.7f) return false;
+    // 放宽高度一致性
+    float height_ratio = std::min(l1.length, l2.length) / std::max(l1.length, l2.length);
+    if (height_ratio < 0.4f) return false;  // 从0.6放宽到0.4
     
+    // 放宽距离合理性
     float distance = cv::norm(l1.center - l2.center);
     float distance_ratio = distance / avg_length;
-    if (distance_ratio < 1.0f || distance_ratio > 4.5f) return false;
+    if (distance_ratio < 0.8f || distance_ratio > 6.0f) return false;  // 放宽距离范围
     
-    float angle_diff = abs(l1.tilt_angle - l2.tilt_angle);
+    // 放宽角度差
+    float angle_diff = std::abs(l1.tilt_angle - l2.tilt_angle);
     if (angle_diff > max_angle_diff_) return false;
     
-    // float y_diff = abs(l1.center.y - l2.center.y);
-    // if (y_diff > avg_length * max_height_diff_ratio_) return false;
+    // 放宽水平对齐
+    float y_diff = std::abs(l1.center.y - l2.center.y);
+    if (y_diff > avg_length * max_height_diff_ratio_) return false;
+    
+    // 放宽方向一致性
+    float dot_product = std::abs(std::cos(l1.tilt_angle * CV_PI / 180.0f) * 
+                                std::cos(l2.tilt_angle * CV_PI / 180.0f) +
+                                std::sin(l1.tilt_angle * CV_PI / 180.0f) * 
+                                std::sin(l2.tilt_angle * CV_PI / 180.0f));
+    if (dot_product < 0.5f) return false; // 从0.7放宽到0.5
     
     return true;
   }
 
-  // ============================ 可视化与日志 ============================
   void publishBoundingBoxes(const cv::Mat& frame, const std::vector<Light>& lights, const std_msgs::msg::Header& header)
   {
     if (bbox_pub_.getNumSubscribers() == 0) return;
@@ -244,6 +248,9 @@ private:
       for (int i = 0; i < 4; i++) {
         cv::line(bbox_frame, vertices[i], vertices[(i + 1) % 4], cv::Scalar(0, 255, 0), 2);
       }
+      // 显示角度信息
+      std::string angle_info = std::to_string((int)light.tilt_angle);
+      cv::putText(bbox_frame, angle_info, light.center, cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255, 255, 255), 1);
     }
     auto bbox_msg = cv_bridge::CvImage(header, "bgr8", bbox_frame).toImageMsg();
     bbox_pub_.publish(std::move(bbox_msg));
@@ -259,7 +266,9 @@ private:
       for (int i = 0; i < 4; i++) {
         cv::line(lights_frame, vertices[i], vertices[(i + 1) % 4], cv::Scalar(0, 255, 255), 2);
       }
-      cv::line(lights_frame, light.top, light.bottom, cv::Scalar(255, 0, 0), 2);
+      cv::line(lights_frame, light.top, light.bottom, cv::Scalar(255, 0, 0), 3);
+      // 绘制角度方向
+      cv::arrowedLine(lights_frame, light.center, light.bottom, cv::Scalar(0, 0, 255), 2);
     }
     auto lights_msg = cv_bridge::CvImage(header, "bgr8", lights_frame).toImageMsg();
     lights_pub_.publish(std::move(lights_msg));
@@ -272,13 +281,41 @@ private:
     for (const auto& armor : armors) {
       const Light& l1 = armor.first;
       const Light& l2 = armor.second;
-      std::vector<cv::Point2f> armor_points = { l1.top, l2.top, l2.bottom, l1.bottom };
-      for (int i = 0; i < 4; i++) {
-        cv::line(result_frame, armor_points[i], armor_points[(i + 1) % 4], cv::Scalar(0, 255, 0), 2);
-      }
+      
+      // 新的装甲板区域绘制方法
+      drawArmorRegion(result_frame, l1, l2);
     }
     auto result_msg = cv_bridge::CvImage(header, "bgr8", result_frame).toImageMsg();
     result_pub_.publish(std::move(result_msg));
+  }
+
+  void drawArmorRegion(cv::Mat& frame, const Light& l1, const Light& l2)
+  {
+    // 计算两个灯条之间的中心点
+    cv::Point2f center = (l1.center + l2.center) * 0.5f;
+    
+    // 计算装甲板宽度（灯条之间的距离）
+    float armor_width = cv::norm(l1.center - l2.center);
+    
+    // 计算装甲板高度（取两个灯条高度的平均值，并上下延伸一定比例）
+    float avg_height = (l1.length + l2.length) * 0.5f;
+    float armor_height = avg_height * (1.0f + armor_height_extension_);
+    
+    // 计算装甲板的角度（使用两个灯条角度的平均值）
+    float armor_angle = (l1.tilt_angle + l2.tilt_angle) * 0.5f;
+    
+    // 创建装甲板的旋转矩形
+    cv::RotatedRect armor_rect(center, cv::Size2f(armor_width, armor_height), armor_angle);
+    
+    // 绘制装甲板区域
+    cv::Point2f vertices[4];
+    armor_rect.points(vertices);
+    for (int i = 0; i < 4; i++) {
+      cv::line(frame, vertices[i], vertices[(i + 1) % 4], cv::Scalar(0, 255, 0), 3);
+    }
+    
+    // 可选：在装甲板中心绘制标记
+    cv::circle(frame, center, 5, cv::Scalar(0, 0, 255), -1);
   }
 
   void logPerformance(const std::chrono::high_resolution_clock::time_point& start_time, int armor_count, int light_count)
@@ -288,20 +325,20 @@ private:
     frame_count_++;
     total_time_ += duration.count();
     if (frame_count_ >= 30) {
-      // 只显示检测结果统计，不显示FPS
       RCLCPP_INFO(this->get_logger(), "Lights Found: %d, Armors Found: %d", light_count, armor_count);
       frame_count_ = 0;
       total_time_ = 0;
     }
   }
 
-  // ============================ 成员变量 ============================
+  // 成员变量
   image_transport::Subscriber subscription_;
   image_transport::Publisher result_pub_, binary_pub_, lights_pub_, bbox_pub_;
   
   int binary_thres_, detect_color_, min_contour_area_, max_contour_area_;
   bool debug_;
-  double min_lightbar_ratio_, max_lightbar_ratio_, max_angle_diff_, max_height_diff_ratio_;
+  double min_lightbar_ratio_, max_lightbar_ratio_, max_angle_diff_, max_height_diff_ratio_, max_tilt_angle_;
+  double armor_height_extension_;  // 装甲板高度延伸比例
   
   int frame_count_ = 0;
   long long total_time_ = 0;
