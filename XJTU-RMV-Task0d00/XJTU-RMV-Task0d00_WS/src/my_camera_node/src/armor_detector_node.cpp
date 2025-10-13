@@ -44,11 +44,8 @@ public:
         this->cameraInfoCallback(msg);
       });
 
-    // 发布结果和调试话题
+    // 发布结果话题（删除其他调试话题）
     result_pub_ = image_transport::create_publisher(this, "armor_detector/result", qos.get_rmw_qos_profile());
-    binary_pub_ = image_transport::create_publisher(this, "armor_detector/binary_mask", qos.get_rmw_qos_profile());
-    lights_pub_ = image_transport::create_publisher(this, "armor_detector/lights", qos.get_rmw_qos_profile());
-    bbox_pub_ = image_transport::create_publisher(this, "armor_detector/bounding_boxes", qos.get_rmw_qos_profile());
     
     // 发布装甲板3D坐标
     pose_pub_ = this->create_publisher<geometry_msgs::msg::PoseArray>("armor_detector/armor_poses", 10);
@@ -65,8 +62,8 @@ public:
     this->declare_parameter("max_height_diff_ratio", 0.7);
     this->declare_parameter("max_tilt_angle", 60.0);
     this->declare_parameter("armor_height_extension", 0.3);
-    this->declare_parameter("armor_width", 0.135);  // 新增：装甲板实际宽度
-    this->declare_parameter("armor_height", 0.055); // 新增：装甲板实际高度
+    this->declare_parameter("armor_width", 0.135);
+    this->declare_parameter("armor_height", 0.055);
 
     // 加载参数
     binary_thres_ = this->get_parameter("binary_thres").as_int();
@@ -207,16 +204,7 @@ private:
         publishArmorCoordinates(armors, msg->header);
       }
       
-      // 调试信息发布
-      if (debug_) {
-        publishBoundingBoxes(frame, lights, msg->header);
-        publishLightVisualization(frame, lights, msg->header);
-        if (binary_pub_.getNumSubscribers() > 0) {
-            auto mask_msg = cv_bridge::CvImage(msg->header, "mono8", binary_img).toImageMsg();
-            binary_pub_.publish(std::move(mask_msg));
-        }
-      }
-      
+      // 只发布最终结果（删除其他调试发布）
       publishResult(frame, armors, msg->header);
       logPerformance(start_time, armors.size(), lights.size());
       
@@ -311,9 +299,6 @@ private:
   bool isValidArmorPair(const Light& l1, const Light& l2)
   {
     float avg_length = (l1.length + l2.length) * 0.5f;
-
-    // float height_ratio = std::min(l1.length, l2.length) / std::max(l1.length, l2.length);
-    // if (height_ratio < 0.4f) return false;
     
     float distance = cv::norm(l1.center - l2.center);
     float distance_ratio = distance / avg_length;
@@ -334,26 +319,41 @@ private:
     return true;
   }
 
+  // 改进的PnP解算函数
   void solvePnPForArmors(std::vector<Armor>& armors)
   {
     for (auto& armor : armors) {
-      if (armor.corners.size() != 4) continue;
-      
-      // 确保角点顺序与3D点顺序一致
-      std::vector<cv::Point2f> image_points = orderArmorCorners(armor.corners);
+      // 使用灯条端点作为角点（更稳定）
+      std::vector<cv::Point2f> image_points;
+      image_points.emplace_back(armor.left_light.bottom);   // 左下
+      image_points.emplace_back(armor.left_light.top);      // 左上  
+      image_points.emplace_back(armor.right_light.top);     // 右上
+      image_points.emplace_back(armor.right_light.bottom);  // 右下
       
       cv::Mat rvec, tvec;
       bool success = false;
       
       try {
+        // 使用IPPE算法，专门用于平面物体
         success = cv::solvePnP(armor_points_3d_, image_points, camera_matrix_, 
-                              dist_coeffs_, rvec, tvec, false, cv::SOLVEPNP_ITERATIVE);
+                              dist_coeffs_, rvec, tvec, false, cv::SOLVEPNP_IPPE);
         
         if (success) {
-          armor.camera_coordinates = cv::Point3f(tvec.at<double>(0), 
-                                                tvec.at<double>(1), 
-                                                tvec.at<double>(2));
-          armor.valid_pose = true;
+          double x = tvec.at<double>(0);
+          double y = tvec.at<double>(1); 
+          double z = tvec.at<double>(2);
+          double distance = cv::norm(tvec);
+          
+          // 重投影误差验证
+          double reproj_error = calculateReprojectionError(armor_points_3d_, image_points, rvec, tvec);
+          
+          // 综合合理性检查
+          if (distance > 0.2 && distance < 8.0 && z > 0 && reproj_error < 10.0) {
+            armor.camera_coordinates = cv::Point3f(x, y, z);
+            armor.valid_pose = true;
+          } else {
+            armor.valid_pose = false;
+          }
         }
       } catch (const std::exception& e) {
         armor.valid_pose = false;
@@ -361,27 +361,19 @@ private:
     }
   }
 
-  std::vector<cv::Point2f> orderArmorCorners(const std::vector<cv::Point2f>& corners)
+  // 重投影误差计算函数
+  double calculateReprojectionError(const std::vector<cv::Point3f>& object_points,
+                                   const std::vector<cv::Point2f>& image_points,
+                                   const cv::Mat& rvec, const cv::Mat& tvec)
   {
-    if (corners.size() != 4) return corners;
+    std::vector<cv::Point2f> projected_points;
+    cv::projectPoints(object_points, rvec, tvec, camera_matrix_, dist_coeffs_, projected_points);
     
-    // 找到中心点
-    cv::Point2f center(0, 0);
-    for (const auto& corner : corners) {
-      center += corner;
+    double total_error = 0.0;
+    for (size_t i = 0; i < image_points.size(); i++) {
+      total_error += cv::norm(image_points[i] - projected_points[i]);
     }
-    center *= 0.25f;
-    
-    // 按顺序排序：左上、右上、右下、左下
-    std::vector<cv::Point2f> ordered(4);
-    for (const auto& corner : corners) {
-      if (corner.x < center.x && corner.y < center.y) ordered[0] = corner;
-      else if (corner.x > center.x && corner.y < center.y) ordered[1] = corner;
-      else if (corner.x > center.x && corner.y > center.y) ordered[2] = corner;
-      else if (corner.x < center.x && corner.y > center.y) ordered[3] = corner;
-    }
-    
-    return ordered;
+    return total_error / image_points.size();
   }
 
   void publishArmorCoordinates(const std::vector<Armor>& armors, const std_msgs::msg::Header& header)
@@ -405,41 +397,6 @@ private:
     if (!pose_array.poses.empty()) {
       pose_pub_->publish(pose_array);
     }
-  }
-
-  void publishBoundingBoxes(const cv::Mat& frame, const std::vector<Light>& lights, const std_msgs::msg::Header& header)
-  {
-    if (bbox_pub_.getNumSubscribers() == 0) return;
-    cv::Mat bbox_frame = frame.clone();
-    for (const auto& light : lights) {
-      cv::rectangle(bbox_frame, light.bbox, cv::Scalar(255, 0, 0), 2);
-      cv::Point2f vertices[4];
-      light.rect.points(vertices);
-      for (int i = 0; i < 4; i++) {
-        cv::line(bbox_frame, vertices[i], vertices[(i + 1) % 4], cv::Scalar(0, 255, 0), 2);
-      }
-      std::string angle_info = std::to_string((int)light.tilt_angle);
-      cv::putText(bbox_frame, angle_info, light.center, cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255, 255, 255), 1);
-    }
-    auto bbox_msg = cv_bridge::CvImage(header, "bgr8", bbox_frame).toImageMsg();
-    bbox_pub_.publish(std::move(bbox_msg));
-  }
-
-  void publishLightVisualization(const cv::Mat& frame, const std::vector<Light>& lights, const std_msgs::msg::Header& header)
-  {
-    if (lights_pub_.getNumSubscribers() == 0) return;
-    cv::Mat lights_frame = frame.clone();
-    for (const auto& light : lights) {
-      cv::Point2f vertices[4];
-      light.rect.points(vertices);
-      for (int i = 0; i < 4; i++) {
-        cv::line(lights_frame, vertices[i], vertices[(i + 1) % 4], cv::Scalar(0, 255, 255), 2);
-      }
-      cv::line(lights_frame, light.top, light.bottom, cv::Scalar(255, 0, 0), 3);
-      cv::arrowedLine(lights_frame, light.center, light.bottom, cv::Scalar(0, 0, 255), 2);
-    }
-    auto lights_msg = cv_bridge::CvImage(header, "bgr8", lights_frame).toImageMsg();
-    lights_pub_.publish(std::move(lights_msg));
   }
 
   void publishResult(const cv::Mat& frame, const std::vector<Armor>& armors, const std_msgs::msg::Header& header)
@@ -477,16 +434,17 @@ private:
     frame_count_++;
     total_time_ += duration.count();
     if (frame_count_ >= 30) {
-      RCLCPP_INFO(this->get_logger(), "Lights Found: %d, Armors Found: %d", light_count, armor_count);
+      // 简化性能输出
+      RCLCPP_INFO(this->get_logger(), "Frame processed - Lights: %d, Armors: %d", light_count, armor_count);
       frame_count_ = 0;
       total_time_ = 0;
     }
   }
 
-  // 成员变量
+  // 成员变量（删除调试发布器）
   image_transport::Subscriber subscription_;
   rclcpp::Subscription<sensor_msgs::msg::CameraInfo>::SharedPtr camera_info_sub_;
-  image_transport::Publisher result_pub_, binary_pub_, lights_pub_, bbox_pub_;
+  image_transport::Publisher result_pub_;  // 只保留结果发布器
   rclcpp::Publisher<geometry_msgs::msg::PoseArray>::SharedPtr pose_pub_;
   
   int binary_thres_, detect_color_, min_contour_area_, max_contour_area_;
