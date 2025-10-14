@@ -307,15 +307,6 @@ private:
     float angle_diff = std::abs(l1.tilt_angle - l2.tilt_angle);
     if (angle_diff > max_angle_diff_) return false;
     
-    // float y_diff = std::abs(l1.center.y - l2.center.y);
-    // if (y_diff > avg_length * max_height_diff_ratio_) return false;
-    
-    // float dot_product = std::abs(std::cos(l1.tilt_angle * CV_PI / 180.0f) * 
-    //                             std::cos(l2.tilt_angle * CV_PI / 180.0f) +
-    //                             std::sin(l1.tilt_angle * CV_PI / 180.0f) * 
-    //                             std::sin(l2.tilt_angle * CV_PI / 180.0f));
-    // if (dot_product < 0.5f) return false;
-    
     return true;
   }
 
