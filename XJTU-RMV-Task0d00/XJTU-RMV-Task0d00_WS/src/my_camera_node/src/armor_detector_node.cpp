@@ -51,7 +51,7 @@ public:
     pose_pub_ = this->create_publisher<geometry_msgs::msg::PoseArray>("armor_detector/armor_poses", 10);
     
     // 声明所有可调参数
-    this->declare_parameter("binary_thres", 80);
+    this->declare_parameter("binary_thres", 200);
     this->declare_parameter("detect_color", 1); // 0: RED, 1: BLUE
     this->declare_parameter("debug", true);
     this->declare_parameter("min_contour_area", 20);
@@ -61,9 +61,9 @@ public:
     this->declare_parameter("max_angle_diff", 30.0);
     this->declare_parameter("max_height_diff_ratio", 0.7);
     this->declare_parameter("max_tilt_angle", 60.0);
-    this->declare_parameter("armor_height_extension", 0.3);
+    this->declare_parameter("armor_height_extension", 0);
     this->declare_parameter("armor_width", 0.135);
-    this->declare_parameter("armor_height", 0.055);
+    this->declare_parameter("armor_height", 0.056);
 
     // 加载参数
     binary_thres_ = this->get_parameter("binary_thres").as_int();
@@ -166,21 +166,25 @@ private:
                 camera_matrix_.at<double>(0,0), camera_matrix_.at<double>(1,1));
   }
 
+  // MODIFIED FUNCTION
   void initArmor3DPoints()
   {
-    // 装甲板3D模型点（世界坐标系，以装甲板中心为原点）
-    double w = armor_width_ / 2.0;
-    double h = armor_height_ / 2.0;
+    // 装甲板3D模型点
+    // 坐标系: X轴向前, Y轴向左, Z轴向上
+    // 单位: 米
+    double half_y = armor_width_ / 2.0;
+    double half_z = armor_height_ / 2.0;
     
     armor_points_3d_.clear();
-    armor_points_3d_.push_back(cv::Point3f(-w, -h, 0)); // 左上
-    armor_points_3d_.push_back(cv::Point3f(w, -h, 0));  // 右上
-    armor_points_3d_.push_back(cv::Point3f(w, h, 0));   // 右下
-    armor_points_3d_.push_back(cv::Point3f(-w, h, 0));  // 左下
+    // 顺序: 左下, 左上, 右上, 右下
+    armor_points_3d_.emplace_back(cv::Point3f(0, half_y, -half_z));
+    armor_points_3d_.emplace_back(cv::Point3f(0, half_y, half_z));
+    armor_points_3d_.emplace_back(cv::Point3f(0, -half_y, half_z));
+    armor_points_3d_.emplace_back(cv::Point3f(0, -half_y, -half_z));
   }
 
   void detectCallback(const sensor_msgs::msg::Image::ConstSharedPtr& msg)
-  {
+  { 
     // 时间戳去重
     if (msg->header.stamp.sec == last_frame_stamp_.sec && 
         msg->header.stamp.nanosec == last_frame_stamp_.nanosec) {
@@ -319,43 +323,41 @@ private:
     return true;
   }
 
-  // 改进的PnP解算函数
+  // MODIFIED FUNCTION
+  // [最终诊断版本] 检查所有输入的 solvePnPForArmors 函数
   void solvePnPForArmors(std::vector<Armor>& armors)
   {
     for (auto& armor : armors) {
-      // 使用灯条端点作为角点（更稳定）
+      // 2. 准备2D点
       std::vector<cv::Point2f> image_points;
-      image_points.emplace_back(armor.left_light.bottom);   // 左下
-      image_points.emplace_back(armor.left_light.top);      // 左上  
-      image_points.emplace_back(armor.right_light.top);     // 右上
-      image_points.emplace_back(armor.right_light.bottom);  // 右下
-      
+      image_points.emplace_back(armor.left_light.bottom);
+      image_points.emplace_back(armor.left_light.top);
+      image_points.emplace_back(armor.right_light.top);
+      image_points.emplace_back(armor.right_light.bottom);
+
+      // 3. 在调用前打印日志，确认输入是正常的
+      // RCLCPP_INFO(this->get_logger(), "Attempting PnP with %zu image points.", image_points.size());
+      // 你可以取消下面这行注释，看到具体的像素坐标
+      // for(const auto& p : image_points) { RCLCPP_INFO(this->get_logger(), "  - (%.1f, %.1f)", p.x, p.y); }
+
       cv::Mat rvec, tvec;
       bool success = false;
       
       try {
-        // 使用IPPE算法，专门用于平面物体
         success = cv::solvePnP(armor_points_3d_, image_points, camera_matrix_, 
                               dist_coeffs_, rvec, tvec, false, cv::SOLVEPNP_IPPE);
         
         if (success) {
+          RCLCPP_INFO(this->get_logger(), "PnP Succeeded!");
           double x = tvec.at<double>(0);
           double y = tvec.at<double>(1); 
           double z = tvec.at<double>(2);
-          double distance = cv::norm(tvec);
-          
-          // 重投影误差验证
-          double reproj_error = calculateReprojectionError(armor_points_3d_, image_points, rvec, tvec);
-          
-          // 综合合理性检查
-          if (distance > 0.2 && distance < 8.0 && z > 0 && reproj_error < 10.0) {
-            armor.camera_coordinates = cv::Point3f(x, y, z);
-            armor.valid_pose = true;
-          } else {
-            armor.valid_pose = false;
-          }
+          armor.camera_coordinates = cv::Point3f(x, y, z);
+          armor.valid_pose = true;
         }
-      } catch (const std::exception& e) {
+
+      } catch (const cv::Exception& e) {
+        RCLCPP_FATAL(this->get_logger(), "PnP CRASHED: cv::solvePnP threw an exception: %s", e.what());
         armor.valid_pose = false;
       }
     }
@@ -390,7 +392,8 @@ private:
       pose.position.x = armor.camera_coordinates.x;
       pose.position.y = armor.camera_coordinates.y;
       pose.position.z = armor.camera_coordinates.z;
-      pose.orientation.w = 1.0;
+      // Nota: La orientación no se calcula aquí. Se deja como identidad.
+      pose.orientation.w = 1.0; 
       pose_array.poses.push_back(pose);
     }
     

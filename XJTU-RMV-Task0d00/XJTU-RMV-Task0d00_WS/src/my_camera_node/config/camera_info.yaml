@@ -1,20 +1,38 @@
-image_width: 640
-image_height: 480
-camera_name: "new_camera"
+# Camera calibration file generated from MATLAB data for a 1440x1080 resolution camera.
+
+image_width: 1440
+image_height: 1080
+
+# You can change the camera name if you want
+camera_name: "hik_camera"
+
+# K - Intrinsic camera matrix
 camera_matrix:
   rows: 3
   cols: 3
-  data: [244.459, 0.0, 77.300, 0.0, 246.355, 80.204, 0.0, 0.0, 1.0]
+  data: [4445.94878, 0.0,         749.43995, 
+         0.0,        4431.39433,  488.12891, 
+         0.0,        0.0,         1.0]
+
+
 distortion_model: plumb_bob
 distortion_coefficients:
   rows: 1
   cols: 5
-  data: [0.113528, -0.575091, 0.000000, 0.000000, 0.000000]
+  data: [0.17074, 1.71044, 0.0, 0.0, 0.0]
+
+
 rectification_matrix:
   rows: 3
   cols: 3
-  data: [1, 0, 0, 0, 1, 0, 0, 0, 1]
+  data: [1, 0, 0, 
+         0, 1, 0, 
+         0, 0, 1]
+
+
 projection_matrix:
   rows: 3
   cols: 4
-  data: [244.459, 0.0, 77.300, 0.0, 0.0, 246.355, 80.204, 0.0, 0.0, 0.0, 1.0, 0.0]
+  data: [4445.94878, 0.0,         749.43995, 0.0,
+         0.0,        4431.39433,  488.12891, 0.0,
+         0.0,        0.0,         1.0,       0.0]
