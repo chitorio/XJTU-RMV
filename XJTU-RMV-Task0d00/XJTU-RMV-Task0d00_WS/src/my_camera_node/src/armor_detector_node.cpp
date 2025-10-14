@@ -162,39 +162,51 @@ private:
       cv_bridge::CvImageConstPtr cv_ptr = cv_bridge::toCvShare(msg, "bgr8");
       const cv::Mat& frame = cv_ptr->image;
       
-      // 步骤 1: 2D检测，得到初步的候选装甲板
+      // ================= 步骤 1: 每帧都进行完整的2D检测和验证 =================
       cv::Mat binary_img = preprocessImage(frame);
       std::vector<Light> lights = findLights(binary_img);
       std::vector<Armor> current_armors = matchLights(lights);
       
-      // 步骤 2 (IF判断条件): 使用DNN分类器验证候选装甲板
-      // classifier_->processArmors 函数会就地修改 current_armors 列表，
-      // 只保留那些被识别为有效数字的装甲板。
+      // DNN验证
       // if (!current_armors.empty() && classifier_) {
       //   classifier_->processArmors(frame, current_armors);
       // }
       
-      // 步骤 3: 为通过了验证的装甲板进行PnP解算（带跳帧优化）
+      // ================= 步骤 2: 按频率进行PnP计算并缓存结果 =================
       if (!current_armors.empty()) {
-        // 如果当前帧有通过了所有验证的有效目标
+        // 如果当前帧检测到了有效目标
         pnp_update_counter_++;
         if (pnp_update_counter_ >= pnp_update_rate_) {
-          pnp_update_counter_ = 0;
+          pnp_update_counter_ = 0; // 重置计数器
+          
           if (camera_info_received_) {
+            // 时间到了，进行PnP解算
             solvePnPForArmors(current_armors);
-            publishArmorCoordinates(current_armors, msg->header);
+            // 将带有最新PnP结果的装甲板信息缓存下来
+            last_valid_pnp_armors_ = current_armors; 
+            publishArmorCoordinates(last_valid_pnp_armors_, msg->header);
           }
-          armors_to_publish_ = current_armors;
         }
       } else {
-        // 如果没有有效目标，则清空
-        armors_to_publish_.clear();
-        pnp_update_counter_ = 0;
+        // 如果当前帧没有检测到目标，则清空缓存
+        last_valid_pnp_armors_.clear();
+        pnp_update_counter_ = 0; // 目标丢失时也重置计数器
+      }
+
+      // ================= 步骤 3: 结果融合与发布 =================
+      // 关键逻辑：将缓存的3D坐标 "嫁接" 到当前帧的2D检测结果上
+      if (!current_armors.empty() && !last_valid_pnp_armors_.empty()) {
+          // 简化处理：假设只有一个目标，直接把缓存的第一个结果赋给当前帧的第一个目标
+          // 在多目标场景下需要更复杂的跟踪匹配逻辑
+          if (last_valid_pnp_armors_[0].valid_pose) {
+              current_armors[0].camera_coordinates = last_valid_pnp_armors_[0].camera_coordinates;
+              current_armors[0].valid_pose = true;
+          }
       }
       
-      // 步骤 4: 发布最终结果
-      publishResult(frame, armors_to_publish_, msg->header);
-      logPerformance(start_time, armors_to_publish_.size(), lights.size());
+      // 每一帧都发布带有最新2D框和（可能延迟的）3D坐标的结果
+      publishResult(frame, current_armors, msg->header);
+      logPerformance(start_time, current_armors.size(), lights.size());
       
     } catch (const std::exception& e) {
       RCLCPP_ERROR(this->get_logger(), "Detection error: %s", e.what());
@@ -325,16 +337,21 @@ private:
                               dist_coeffs_, rvec, tvec, false, cv::SOLVEPNP_IPPE);
         
         if (success) {
-          RCLCPP_INFO(this->get_logger(), "PnP Succeeded!");
-          double x = tvec.at<double>(0);
-          double y = tvec.at<double>(1); 
+          // 在这里可以加入我们之前讨论过的合理性检查
           double z = tvec.at<double>(2);
-          armor.camera_coordinates = cv::Point3f(x, y, z);
-          armor.valid_pose = true;
+          if (z > 0.3 && z < 10.0) { // 简单的距离检查
+            RCLCPP_INFO(this->get_logger(), "PnP Succeeded! Distance: %.2f m", z);
+            armor.camera_coordinates = cv::Point3f(tvec.at<double>(0), tvec.at<double>(1), z);
+            armor.valid_pose = true;
+          } else {
+             armor.valid_pose = false;
+          }
+        } else {
+           armor.valid_pose = false;
         }
 
       } catch (const cv::Exception& e) {
-        RCLCPP_FATAL(this->get_logger(), "PnP CRASHED: cv::solvePnP threw an exception: %s", e.what());
+        RCLCPP_ERROR(this->get_logger(), "PnP CRASHED: cv::solvePnP threw an exception: %s", e.what());
         armor.valid_pose = false;
       }
     }
@@ -442,7 +459,7 @@ private:
 
   int pnp_update_counter_ = 0;
   int pnp_update_rate_;
-  std::vector<Armor> armors_to_publish_;
+  std::vector<Armor> last_valid_pnp_armors_;
 
   // 分类器成员变量
   std::unique_ptr<NumberClassifier> classifier_;
