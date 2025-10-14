@@ -15,11 +15,14 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # --- 依赖项查找 ---
 find_package(ament_cmake_auto REQUIRED)
 ament_auto_find_build_dependencies()
-find_package(OpenCV REQUIRED)
+# [!!!] MODIFIED LINE: Explicitly find the DNN component of OpenCV [!!!]
+find_package(OpenCV REQUIRED COMPONENTS core imgproc calib3d dnn)
 
 # --- 1. 构建装甲板识别节点 (作为独立可执行文件) ---
 ament_auto_add_executable(armor_detector_node
   src/armor_detector_node.cpp
+  # [!!!] ADDED LINE: Add the new source file to the build [!!!]
+  src/number_classifier.cpp
 )
 target_link_libraries(armor_detector_node
   ${OpenCV_LIBS}

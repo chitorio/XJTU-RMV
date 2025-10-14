@@ -1,0 +1,9 @@
+1
+2
+3
+4
+5
+6outpost
+7guard
+8base
+9neg

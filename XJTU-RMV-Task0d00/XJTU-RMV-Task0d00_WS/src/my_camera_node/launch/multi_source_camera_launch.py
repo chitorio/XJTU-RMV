@@ -19,6 +19,19 @@ def generate_launch_description():
         'camera_params.yaml'
     )
 
+    # [!!!] 新增：拼接模型文件的路径 [!!!]
+    model_path_file = os.path.join(
+        pkg_share,
+        'model',
+        'model.onnx'
+    )
+    label_path_file = os.path.join(
+        pkg_share,
+        'model',
+        'labels.txt'
+    )
+
+
     # --- 2. 声明可以在命令行中覆盖的启动参数 ---
     # 这是最关键的参数，用于切换模式
     source_mode_arg = DeclareLaunchArgument(
@@ -54,16 +67,26 @@ def generate_launch_description():
         ]
     )
 
-    # 装甲板检测节点
+    # [!!!] 修改点：为装甲板检测节点添加模型参数 [!!!]
     detector_node = Node(
         package="my_camera_node",
         executable="armor_detector_node",
         name="armor_detector_node",
         output="screen",
         parameters=[{
-            "binary_thres": 160,
+            # --- 原有的参数 ---
+            "binary_thres": 200,
             "detect_color": 1, # 0=RED, 1=BLUE
             "debug": True,
+            
+            # --- 新增的模型参数 ---
+            "model_path": model_path_file,
+            "label_path": label_path_file,
+            "classifier_threshold": 0.75, # 分类器置信度阈值，您可以根据需要调整
+
+            # --- 其他参数也可以在这里设置 ---
+            # "pnp_update_rate": 3, 
+            # "armor_width": 0.135,
         }]
     )
 

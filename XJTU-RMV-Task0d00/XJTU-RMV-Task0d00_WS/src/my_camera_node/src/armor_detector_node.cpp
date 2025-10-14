@@ -14,6 +14,10 @@
 #include <opencv2/opencv.hpp>
 #include <rclcpp/parameter_event_handler.hpp>
 
+// 包含共享的类型定义和分类器头文件
+#include "armor_types.hpp"
+#include "number_classifier.hpp"
+
 using namespace std;
 using namespace cv;
 
@@ -44,7 +48,7 @@ public:
         this->cameraInfoCallback(msg);
       });
 
-    // 发布结果话题（删除其他调试话题）
+    // 发布结果话题
     result_pub_ = image_transport::create_publisher(this, "armor_detector/result", qos.get_rmw_qos_profile());
     
     // 发布装甲板3D坐标
@@ -52,7 +56,7 @@ public:
     
     // 声明所有可调参数
     this->declare_parameter("binary_thres", 200);
-    this->declare_parameter("detect_color", 1); // 0: RED, 1: BLUE
+    this->declare_parameter("detect_color", 1);
     this->declare_parameter("debug", true);
     this->declare_parameter("min_contour_area", 20);
     this->declare_parameter("max_contour_area", 12000);
@@ -61,9 +65,10 @@ public:
     this->declare_parameter("max_angle_diff", 30.0);
     this->declare_parameter("max_height_diff_ratio", 0.7);
     this->declare_parameter("max_tilt_angle", 60.0);
-    this->declare_parameter("armor_height_extension", 0);
+    this->declare_parameter("armor_height_extension", 0.0);
     this->declare_parameter("armor_width", 0.135);
     this->declare_parameter("armor_height", 0.056);
+    this->declare_parameter("pnp_update_rate", 10);
 
     // 加载参数
     binary_thres_ = this->get_parameter("binary_thres").as_int();
@@ -79,73 +84,28 @@ public:
     armor_height_extension_ = this->get_parameter("armor_height_extension").as_double();
     armor_width_ = this->get_parameter("armor_width").as_double();
     armor_height_ = this->get_parameter("armor_height").as_double();
+    pnp_update_rate_ = this->get_parameter("pnp_update_rate").as_int();
+    
+    // 声明模型相关参数并初始化分类器
+    this->declare_parameter("model_path", "model/model.onnx");
+    this->declare_parameter("label_path", "model/labels.txt");
+    this->declare_parameter("classifier_threshold", 0.75);
+
+    auto model_path = this->get_parameter("model_path").as_string();
+    auto label_path = this->get_parameter("label_path").as_string();
+    auto classifier_threshold = this->get_parameter("classifier_threshold").as_double();
+    
+    classifier_ = std::make_unique<NumberClassifier>(this, model_path, label_path, classifier_threshold);
 
     // 初始化装甲板3D模型点
     initArmor3DPoints();
-
-    // 声明并获取PnP更新频率参数
-    this->declare_parameter("pnp_update_rate", 3);
-    pnp_update_rate_ = this->get_parameter("pnp_update_rate").as_int();
 
     RCLCPP_INFO(this->get_logger(), "Armor Detector started - Color: %s, PnP Rate: 1/%d frames",
               detect_color_ == 0 ? "RED" : "BLUE", pnp_update_rate_);
   }
 
 private:
-  struct Light {
-    cv::RotatedRect rect;
-    cv::Rect bbox;
-    cv::Point2f top, bottom;
-    double length;
-    double width;
-    cv::Point2f center;
-    float tilt_angle;
-    int color;
-    double area;
-    
-    Light(cv::RotatedRect r, cv::Rect b, double a) : rect(r), bbox(b), area(a) {
-      center = r.center;
-      
-      width = r.size.width;
-      length = r.size.height;
-      tilt_angle = r.angle;
-      
-      if (r.size.width > r.size.height) {
-        width = r.size.height;
-        length = r.size.width;
-        tilt_angle = r.angle + 90.0f;
-      }
-      
-      while (tilt_angle > 90.0f) tilt_angle -= 180.0f;
-      while (tilt_angle < -90.0f) tilt_angle += 180.0f;
-      
-      float angle_rad = tilt_angle * CV_PI / 180.0f;
-      float dx = length * 0.5f * std::cos(angle_rad);
-      float dy = length * 0.5f * std::sin(angle_rad);
-      
-      top = cv::Point2f(center.x - dx, center.y - dy);
-      bottom = cv::Point2f(center.x + dx, center.y + dy);
-      
-      if (top.y > bottom.y) {
-        std::swap(top, bottom);
-      }
-    }
-  };
-
-  struct Armor {
-    Light left_light;
-    Light right_light;
-    cv::RotatedRect rect;
-    cv::Point2f center;
-    std::vector<cv::Point2f> corners;
-    cv::Point3f camera_coordinates;
-    bool valid_pose;
-    
-    Armor(const Light& l1, const Light& l2, const cv::RotatedRect& r) 
-      : left_light(l1), right_light(l2), rect(r), valid_pose(false) {
-      center = (l1.center + l2.center) * 0.5f;
-    }
-  };
+  // Light 和 Armor 结构体已移至 "armor_types.hpp"
 
   void cameraInfoCallback(const sensor_msgs::msg::CameraInfo::SharedPtr msg)
   {
@@ -187,7 +147,6 @@ private:
     armor_points_3d_.emplace_back(cv::Point3f(0, -half_y, -half_z));
   }
 
-  // [!!!] MODIFIED FUNCTION [!!!]
   void detectCallback(const sensor_msgs::msg::Image::ConstSharedPtr& msg)
   {
     // 时间戳去重
@@ -203,33 +162,37 @@ private:
       cv_bridge::CvImageConstPtr cv_ptr = cv_bridge::toCvShare(msg, "bgr8");
       const cv::Mat& frame = cv_ptr->image;
       
-      // 1. 每一帧都进行2D检测
+      // 步骤 1: 2D检测，得到初步的候选装甲板
       cv::Mat binary_img = preprocessImage(frame);
       std::vector<Light> lights = findLights(binary_img);
       std::vector<Armor> current_armors = matchLights(lights);
       
-      // 2. 根据检测结果和计数器，决定是否进行PnP解算
+      // 步骤 2 (IF判断条件): 使用DNN分类器验证候选装甲板
+      // classifier_->processArmors 函数会就地修改 current_armors 列表，
+      // 只保留那些被识别为有效数字的装甲板。
+      // if (!current_armors.empty() && classifier_) {
+      //   classifier_->processArmors(frame, current_armors);
+      // }
+      
+      // 步骤 3: 为通过了验证的装甲板进行PnP解算（带跳帧优化）
       if (!current_armors.empty()) {
-        // 如果当前帧检测到了目标
+        // 如果当前帧有通过了所有验证的有效目标
         pnp_update_counter_++;
         if (pnp_update_counter_ >= pnp_update_rate_) {
-          pnp_update_counter_ = 0; // 重置计数器
-          
+          pnp_update_counter_ = 0;
           if (camera_info_received_) {
-            // 时间到了，进行PnP解算
             solvePnPForArmors(current_armors);
             publishArmorCoordinates(current_armors, msg->header);
           }
-          // 将带有最新PnP结果的装甲板信息保存下来，用于后续显示
           armors_to_publish_ = current_armors;
         }
       } else {
-        // 如果当前帧没有检测到目标，则清空所有要显示的信息
+        // 如果没有有效目标，则清空
         armors_to_publish_.clear();
-        pnp_update_counter_ = 0; // 目标丢失时也重置计数器
+        pnp_update_counter_ = 0;
       }
       
-      // 3. 每一帧都发布结果，避免画面闪烁
+      // 步骤 4: 发布最终结果
       publishResult(frame, armors_to_publish_, msg->header);
       logPerformance(start_time, armors_to_publish_.size(), lights.size());
       
@@ -332,14 +295,14 @@ private:
     float angle_diff = std::abs(l1.tilt_angle - l2.tilt_angle);
     if (angle_diff > max_angle_diff_) return false;
     
-    float y_diff = std::abs(l1.center.y - l2.center.y);
-    if (y_diff > avg_length * max_height_diff_ratio_) return false;
+    // float y_diff = std::abs(l1.center.y - l2.center.y);
+    // if (y_diff > avg_length * max_height_diff_ratio_) return false;
     
-    float dot_product = std::abs(std::cos(l1.tilt_angle * CV_PI / 180.0f) * 
-                                std::cos(l2.tilt_angle * CV_PI / 180.0f) +
-                                std::sin(l1.tilt_angle * CV_PI / 180.0f) * 
-                                std::sin(l2.tilt_angle * CV_PI / 180.0f));
-    if (dot_product < 0.5f) return false;
+    // float dot_product = std::abs(std::cos(l1.tilt_angle * CV_PI / 180.0f) * 
+    //                             std::cos(l2.tilt_angle * CV_PI / 180.0f) +
+    //                             std::sin(l1.tilt_angle * CV_PI / 180.0f) * 
+    //                             std::sin(l2.tilt_angle * CV_PI / 180.0f));
+    // if (dot_product < 0.5f) return false;
     
     return true;
   }
@@ -347,17 +310,12 @@ private:
   void solvePnPForArmors(std::vector<Armor>& armors)
   {
     for (auto& armor : armors) {
-      // 2. 准备2D点
+      // 准备2D点
       std::vector<cv::Point2f> image_points;
       image_points.emplace_back(armor.left_light.bottom);
       image_points.emplace_back(armor.left_light.top);
       image_points.emplace_back(armor.right_light.top);
       image_points.emplace_back(armor.right_light.bottom);
-
-      // 3. 在调用前打印日志，确认输入是正常的
-      // RCLCPP_INFO(this->get_logger(), "Attempting PnP with %zu image points.", image_points.size());
-      // 你可以取消下面这行注释，看到具体的像素坐标
-      // for(const auto& p : image_points) { RCLCPP_INFO(this->get_logger(), "  - (%.1f, %.1f)", p.x, p.y); }
 
       cv::Mat rvec, tvec;
       bool success = false;
@@ -382,7 +340,6 @@ private:
     }
   }
 
-  // 重投影误差计算函数
   double calculateReprojectionError(const std::vector<cv::Point3f>& object_points,
                                    const std::vector<cv::Point2f>& image_points,
                                    const cv::Mat& rvec, const cv::Mat& tvec)
@@ -411,7 +368,6 @@ private:
       pose.position.x = armor.camera_coordinates.x;
       pose.position.y = armor.camera_coordinates.y;
       pose.position.z = armor.camera_coordinates.z;
-      // Nota: La orientación no se calcula aquí. Se deja como identidad.
       pose.orientation.w = 1.0; 
       pose_array.poses.push_back(pose);
     }
@@ -463,10 +419,10 @@ private:
     }
   }
 
-  // 成员变量（删除调试发布器）
+  // 成员变量
   image_transport::Subscriber subscription_;
   rclcpp::Subscription<sensor_msgs::msg::CameraInfo>::SharedPtr camera_info_sub_;
-  image_transport::Publisher result_pub_;  // 只保留结果发布器
+  image_transport::Publisher result_pub_;
   rclcpp::Publisher<geometry_msgs::msg::PoseArray>::SharedPtr pose_pub_;
   
   int binary_thres_, detect_color_, min_contour_area_, max_contour_area_;
@@ -482,14 +438,14 @@ private:
   
   int frame_count_ = 0;
   long long total_time_ = 0;
-
   builtin_interfaces::msg::Time last_frame_stamp_;
 
   int pnp_update_counter_ = 0;
   int pnp_update_rate_;
+  std::vector<Armor> armors_to_publish_;
 
-  // [!!!] ADDED MEMBER VARIABLE [!!!]
-  std::vector<Armor> armors_to_publish_; // 用于存储并持续发布的装甲板信息
+  // 分类器成员变量
+  std::unique_ptr<NumberClassifier> classifier_;
 };
 
 int main(int argc, char * argv[])
