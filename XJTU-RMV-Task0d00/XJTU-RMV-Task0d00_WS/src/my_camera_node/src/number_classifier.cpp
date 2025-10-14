@@ -1,5 +1,6 @@
 #include "number_classifier.hpp"
 #include <fstream>
+#include <rclcpp/logging.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <set>
 #include <image_transport/image_transport.hpp>
@@ -151,10 +152,16 @@ bool NumberClassifier::detectNumber(const cv::Mat& number_roi, std::string& pred
   
   // 有效数字：1-5
   static const std::set<std::string> valid_numbers = {"1", "2", "3", "4", "5"};
+
+  RCLCPP_DEBUG(
+    node_->get_logger(), "Number detection - Class: %s, Confidence: %.3f, Threshold: %.3f", 
+    predicted_class.c_str(), confidence, confidence_threshold_);
   
   if (confidence > confidence_threshold_ && valid_numbers.count(predicted_class)) {
+    RCLCPP_DEBUG(node_->get_logger(), "Valid number detected: %s", predicted_class.c_str());
     return true;
   }
   
+  RCLCPP_DEBUG(node_->get_logger(), "Invalid number or low confidence");
   return false;
 }

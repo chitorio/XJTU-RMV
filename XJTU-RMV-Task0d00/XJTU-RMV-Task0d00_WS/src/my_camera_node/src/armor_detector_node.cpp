@@ -1,6 +1,7 @@
 #include <memory>
 #include <opencv2/imgproc.hpp>
 #include <opencv2/calib3d.hpp>
+#include <rclcpp/logging.hpp>
 #include <rclcpp/qos.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/image_encodings.hpp>
@@ -58,13 +59,13 @@ public:
     binary_pub_ = image_transport::create_publisher(this, "armor_detector/binary_mask", qos.get_rmw_qos_profile());
     
     // 声明所有可调参数
-    this->declare_parameter("binary_thres", 200);
+    this->declare_parameter("binary_thres", 190);
     this->declare_parameter("detect_color", 1);
     this->declare_parameter("debug", true);
     this->declare_parameter("min_contour_area", 20);
     this->declare_parameter("max_contour_area", 12000);
-    this->declare_parameter("min_lightbar_ratio", 8.0);
-    this->declare_parameter("max_lightbar_ratio", 20.0);
+    this->declare_parameter("min_lightbar_ratio", 4.0);
+    this->declare_parameter("max_lightbar_ratio", 30.0);
     this->declare_parameter("max_angle_diff", 30.0);
     this->declare_parameter("max_height_diff_ratio", 0.7);
     this->declare_parameter("max_tilt_angle", 60.0);
@@ -278,8 +279,11 @@ private:
           const Light& left_light = (l1.center.x < l2.center.x) ? l1 : l2;
           const Light& right_light = (l1.center.x < l2.center.x) ? l2 : l1;
           
+          // 临时：跳过数字检测来测试
+          bool skip_number_check = true; // 临时设置为true来跳过数字检测
+
           // 在配对阶段进行数字检测
-          if (containsValidNumber(frame, left_light, right_light)) {
+          if (skip_number_check || containsValidNumber(frame, left_light, right_light)) {
             // 创建装甲板旋转矩形（使用正常的装甲板高度）
             cv::RotatedRect armor_rect = createArmorRect(left_light, right_light);
             Armor armor(left_light, right_light, armor_rect);
@@ -349,6 +353,11 @@ private:
     // 创建用于数字检测的扩展区域
     cv::RotatedRect number_rect = createNumberDetectionRect(left_light, right_light);
     
+    RCLCPP_DEBUG(this->get_logger(), "Number detection rect - Center: (%.1f, %.1f), Size: (%.1f, %.1f), Angle: %.1f",
+                 number_rect.center.x, number_rect.center.y,
+                 number_rect.size.width, number_rect.size.height,
+                 number_rect.angle);
+
     // 提取数字ROI
     cv::Mat number_roi = extractNumberROI(frame, number_rect);
     if (number_roi.empty()) {
@@ -383,6 +392,13 @@ private:
     cv::Point2f vertices[4];
     rect.points(vertices);
     
+    // 调试：打印顶点坐标
+    RCLCPP_DEBUG(this->get_logger(), "Source vertices: (%.1f,%.1f), (%.1f,%.1f), (%.1f,%.1f), (%.1f,%.1f)",
+                 vertices[0].x, vertices[0].y,
+                 vertices[1].x, vertices[1].y,
+                 vertices[2].x, vertices[2].y,
+                 vertices[3].x, vertices[3].y);
+
     // 定义目标顶点
     cv::Point2f target_vertices[4] = {
       cv::Point(0, warp_height - 1),
@@ -398,13 +414,16 @@ private:
       cv::warpPerspective(frame, number_image, rotation_matrix, cv::Size(warp_width, warp_height));
       
       if (number_image.empty()) {
+        RCLCPP_DEBUG(this->get_logger(), "Warped image is empty");
         return cv::Mat();
       }
       
       // 提取中心区域
       number_image = number_image(
         cv::Rect(cv::Point((warp_width - roi_size.width) / 2, 0), roi_size));
-        
+      
+      RCLCPP_DEBUG(this->get_logger(), "Final ROI size: %dx%d", number_image.cols, number_image.rows);
+      
       return number_image;
       
     } catch (const cv::Exception& e) {
