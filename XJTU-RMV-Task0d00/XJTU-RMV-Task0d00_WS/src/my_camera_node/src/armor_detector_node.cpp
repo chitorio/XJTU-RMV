@@ -83,7 +83,12 @@ public:
     // 初始化装甲板3D模型点
     initArmor3DPoints();
 
-    RCLCPP_INFO(this->get_logger(), "Armor Detector started - Color: %s", detect_color_ == 0 ? "RED" : "BLUE");
+    // 声明并获取PnP更新频率参数
+    this->declare_parameter("pnp_update_rate", 3);
+    pnp_update_rate_ = this->get_parameter("pnp_update_rate").as_int();
+
+    RCLCPP_INFO(this->get_logger(), "Armor Detector started - Color: %s, PnP Rate: 1/%d frames",
+              detect_color_ == 0 ? "RED" : "BLUE", pnp_update_rate_);
   }
 
 private:
@@ -166,7 +171,6 @@ private:
                 camera_matrix_.at<double>(0,0), camera_matrix_.at<double>(1,1));
   }
 
-  // MODIFIED FUNCTION
   void initArmor3DPoints()
   {
     // 装甲板3D模型点
@@ -183,8 +187,9 @@ private:
     armor_points_3d_.emplace_back(cv::Point3f(0, -half_y, -half_z));
   }
 
+  // [!!!] MODIFIED FUNCTION [!!!]
   void detectCallback(const sensor_msgs::msg::Image::ConstSharedPtr& msg)
-  { 
+  {
     // 时间戳去重
     if (msg->header.stamp.sec == last_frame_stamp_.sec && 
         msg->header.stamp.nanosec == last_frame_stamp_.nanosec) {
@@ -198,19 +203,35 @@ private:
       cv_bridge::CvImageConstPtr cv_ptr = cv_bridge::toCvShare(msg, "bgr8");
       const cv::Mat& frame = cv_ptr->image;
       
+      // 1. 每一帧都进行2D检测
       cv::Mat binary_img = preprocessImage(frame);
       std::vector<Light> lights = findLights(binary_img);
-      std::vector<Armor> armors = matchLights(lights);
+      std::vector<Armor> current_armors = matchLights(lights);
       
-      // PnP解算
-      if (camera_info_received_ && !armors.empty()) {
-        solvePnPForArmors(armors);
-        publishArmorCoordinates(armors, msg->header);
+      // 2. 根据检测结果和计数器，决定是否进行PnP解算
+      if (!current_armors.empty()) {
+        // 如果当前帧检测到了目标
+        pnp_update_counter_++;
+        if (pnp_update_counter_ >= pnp_update_rate_) {
+          pnp_update_counter_ = 0; // 重置计数器
+          
+          if (camera_info_received_) {
+            // 时间到了，进行PnP解算
+            solvePnPForArmors(current_armors);
+            publishArmorCoordinates(current_armors, msg->header);
+          }
+          // 将带有最新PnP结果的装甲板信息保存下来，用于后续显示
+          armors_to_publish_ = current_armors;
+        }
+      } else {
+        // 如果当前帧没有检测到目标，则清空所有要显示的信息
+        armors_to_publish_.clear();
+        pnp_update_counter_ = 0; // 目标丢失时也重置计数器
       }
       
-      // 只发布最终结果（删除其他调试发布）
-      publishResult(frame, armors, msg->header);
-      logPerformance(start_time, armors.size(), lights.size());
+      // 3. 每一帧都发布结果，避免画面闪烁
+      publishResult(frame, armors_to_publish_, msg->header);
+      logPerformance(start_time, armors_to_publish_.size(), lights.size());
       
     } catch (const std::exception& e) {
       RCLCPP_ERROR(this->get_logger(), "Detection error: %s", e.what());
@@ -323,8 +344,6 @@ private:
     return true;
   }
 
-  // MODIFIED FUNCTION
-  // [最终诊断版本] 检查所有输入的 solvePnPForArmors 函数
   void solvePnPForArmors(std::vector<Armor>& armors)
   {
     for (auto& armor : armors) {
@@ -465,6 +484,12 @@ private:
   long long total_time_ = 0;
 
   builtin_interfaces::msg::Time last_frame_stamp_;
+
+  int pnp_update_counter_ = 0;
+  int pnp_update_rate_;
+
+  // [!!!] ADDED MEMBER VARIABLE [!!!]
+  std::vector<Armor> armors_to_publish_; // 用于存储并持续发布的装甲板信息
 };
 
 int main(int argc, char * argv[])

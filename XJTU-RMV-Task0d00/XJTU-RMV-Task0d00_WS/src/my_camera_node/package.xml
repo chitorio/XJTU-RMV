@@ -36,6 +36,9 @@
   <!-- 在ROS Image消息和OpenCV Mat之间进行转换的桥梁 -->
   <depend>cv_bridge</depend>
 
+  <depend>geometry_msgs</depend>
+  <depend>libopencv-dev</depend>
+
   <!-- 测试依赖 -->
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>ament_lint_common</test_depend>
