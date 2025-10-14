@@ -59,18 +59,18 @@ public:
     binary_pub_ = image_transport::create_publisher(this, "armor_detector/binary_mask", qos.get_rmw_qos_profile());
     
     // 声明所有可调参数
-    this->declare_parameter("binary_thres", 190);
+    this->declare_parameter("binary_thres", 100);
     this->declare_parameter("detect_color", 1);
     this->declare_parameter("debug", true);
     this->declare_parameter("min_contour_area", 20);
     this->declare_parameter("max_contour_area", 12000);
     this->declare_parameter("min_lightbar_ratio", 4.0);
-    this->declare_parameter("max_lightbar_ratio", 30.0);
+    this->declare_parameter("max_lightbar_ratio", 15.0);
     this->declare_parameter("max_angle_diff", 30.0);
     this->declare_parameter("max_height_diff_ratio", 0.7);
     this->declare_parameter("max_tilt_angle", 60.0);
     this->declare_parameter("armor_height_extension", 0.0);
-    this->declare_parameter("number_height_extension", 1.3);  // 新增：数字检测区域高度扩展
+    this->declare_parameter("number_height_extension", 1.2);  // 新增：数字检测区域高度扩展
     this->declare_parameter("armor_width", 0.135);
     this->declare_parameter("armor_height", 0.056);
     this->declare_parameter("pnp_update_rate", 10);
@@ -175,7 +175,7 @@ private:
       publishBinaryImage(binary_img, msg->header);
       
       std::vector<Light> lights = findLights(binary_img);
-      std::vector<Armor> current_armors = matchLights(frame, lights);  // 修改：传入frame参数
+      std::vector<Armor> current_armors = matchLights(frame, lights);
       
       // ================= 步骤 2: 按频率进行PnP计算并缓存结果 =================
       if (!current_armors.empty()) {
@@ -209,7 +209,7 @@ private:
           }
       }
       
-      // 每一帧都发布带有最新2D框和（可能延迟的）3D坐标的结果
+      // 每一帧都发布带有最新2D框3D坐标的结果
       publishResult(frame, current_armors, msg->header);
       logPerformance(start_time, current_armors.size(), lights.size());
       
@@ -270,31 +270,67 @@ private:
   std::vector<Armor> matchLights(const cv::Mat& frame, const std::vector<Light>& lights)
   {
     std::vector<Armor> armors;
+    int total_pairs = 0;
+    int valid_pairs = 0;
+    int number_passed = 0;
+    
     for (size_t i = 0; i < lights.size(); i++) {
       for (size_t j = i + 1; j < lights.size(); j++) {
+        total_pairs++;
         const Light& l1 = lights[i];
         const Light& l2 = lights[j];
+        
         if (isValidArmorPair(l1, l2)) {
+          valid_pairs++;
           // 确定左右灯条
           const Light& left_light = (l1.center.x < l2.center.x) ? l1 : l2;
           const Light& right_light = (l1.center.x < l2.center.x) ? l2 : l1;
           
-          // 临时：跳过数字检测来测试
-          bool skip_number_check = true; // 临时设置为true来跳过数字检测
-
-          // 在配对阶段进行数字检测
-          if (skip_number_check || containsValidNumber(frame, left_light, right_light)) {
-            // 创建装甲板旋转矩形（使用正常的装甲板高度）
+          bool skip_number_check = false; // 启用数字检测
+          
+          std::string predicted_class;
+          double confidence;
+          bool has_valid_number = false;
+          
+          if (!skip_number_check) {
+            // 在配对阶段进行数字检测
+            has_valid_number = containsValidNumber(frame, left_light, right_light, predicted_class, confidence);
+          } else {
+            // 跳过数字检测时，默认通过
+            has_valid_number = true;
+            predicted_class = "Skipped";
+            confidence = 1.0;
+          }
+          
+          if (skip_number_check || has_valid_number) {
+            number_passed++;
+            // 创建装甲板旋转矩形
             cv::RotatedRect armor_rect = createArmorRect(left_light, right_light);
             Armor armor(left_light, right_light, armor_rect);
             
             // 获取装甲板四个角点
             armor.corners = getArmorCorners(armor_rect);
+            
+            // 保存数字识别结果
+            if (!skip_number_check && has_valid_number) {
+              armor.detected_number = predicted_class;
+              armor.number_confidence = confidence;
+              armor.number_valid = true;
+            } else {
+              armor.detected_number = "Unknown";
+              armor.number_confidence = 0.0;
+              armor.number_valid = false;
+            }
+            
             armors.emplace_back(armor);
           }
         }
       }
     }
+    
+    RCLCPP_DEBUG(this->get_logger(), "Light pairing: %d lights -> %d pairs -> %d valid -> %d number passed -> %d armors", 
+                lights.size(), total_pairs, valid_pairs, number_passed, armors.size());
+    
     return armors;
   }
 
@@ -313,9 +349,9 @@ private:
   cv::RotatedRect createNumberDetectionRect(const Light& left_light, const Light& right_light)
   {
     cv::Point2f center = (left_light.center + right_light.center) * 0.5f;
-    float armor_width = cv::norm(left_light.center - right_light.center);
+    float armor_width = cv::norm(left_light.center - right_light.center) * 0.6f; // 数字区域宽度为装甲板宽度的60%
     float avg_height = (left_light.length + right_light.length) * 0.5f;
-    float extended_height = avg_height * (1.0f + number_height_extension_);  // 使用数字检测扩展
+    float extended_height = avg_height * (1.0f + number_height_extension_);
     float armor_angle = (left_light.tilt_angle + right_light.tilt_angle) * 0.5f;
     
     return cv::RotatedRect(center, cv::Size2f(armor_width, extended_height), armor_angle);
@@ -343,42 +379,40 @@ private:
   }
 
   // 数字检测函数
-  bool containsValidNumber(const cv::Mat& frame, const Light& left_light, const Light& right_light)
+  bool containsValidNumber(const cv::Mat& frame, const Light& left_light, const Light& right_light, 
+                          std::string& predicted_class, double& confidence)
   {
     if (!classifier_) {
       RCLCPP_WARN_ONCE(this->get_logger(), "Classifier not available, skipping number detection");
+      predicted_class = "NoClassifier";
+      confidence = 0.0;
       return true; // 分类器不可用时默认通过
     }
 
     // 创建用于数字检测的扩展区域
     cv::RotatedRect number_rect = createNumberDetectionRect(left_light, right_light);
     
-    RCLCPP_DEBUG(this->get_logger(), "Number detection rect - Center: (%.1f, %.1f), Size: (%.1f, %.1f), Angle: %.1f",
-                 number_rect.center.x, number_rect.center.y,
-                 number_rect.size.width, number_rect.size.height,
-                 number_rect.angle);
-
     // 提取数字ROI
     cv::Mat number_roi = extractNumberROI(frame, number_rect);
     if (number_roi.empty()) {
       RCLCPP_DEBUG(this->get_logger(), "Failed to extract number ROI");
+      predicted_class = "NoROI";
+      confidence = 0.0;
       return false;
     }
 
     // 使用分类器检测数字
-    std::string predicted_class;
-    double confidence;
     bool has_valid_number = classifier_->detectNumber(number_roi, predicted_class, confidence);
     
     if (has_valid_number) {
-      RCLCPP_DEBUG(this->get_logger(), "Detected valid number: %s (confidence: %.3f)", 
-                   predicted_class.c_str(), confidence);
-      return true;
+      RCLCPP_INFO(this->get_logger(), "Valid number detected: %s (confidence: %.3f)", 
+                  predicted_class.c_str(), confidence);
     } else {
-      RCLCPP_DEBUG(this->get_logger(), "Invalid number detected: %s (confidence: %.3f)", 
+      RCLCPP_DEBUG(this->get_logger(), "Invalid number: %s (confidence: %.3f)", 
                    predicted_class.c_str(), confidence);
-      return false;
     }
+    
+    return has_valid_number;
   }
 
   // 提取数字ROI
@@ -392,13 +426,6 @@ private:
     cv::Point2f vertices[4];
     rect.points(vertices);
     
-    // 调试：打印顶点坐标
-    RCLCPP_DEBUG(this->get_logger(), "Source vertices: (%.1f,%.1f), (%.1f,%.1f), (%.1f,%.1f), (%.1f,%.1f)",
-                 vertices[0].x, vertices[0].y,
-                 vertices[1].x, vertices[1].y,
-                 vertices[2].x, vertices[2].y,
-                 vertices[3].x, vertices[3].y);
-
     // 定义目标顶点
     cv::Point2f target_vertices[4] = {
       cv::Point(0, warp_height - 1),
@@ -421,8 +448,6 @@ private:
       // 提取中心区域
       number_image = number_image(
         cv::Rect(cv::Point((warp_width - roi_size.width) / 2, 0), roi_size));
-      
-      RCLCPP_DEBUG(this->get_logger(), "Final ROI size: %dx%d", number_image.cols, number_image.rows);
       
       return number_image;
       
@@ -450,9 +475,8 @@ private:
                               dist_coeffs_, rvec, tvec, false, cv::SOLVEPNP_IPPE);
         
         if (success) {
-          // 在这里可以加入我们之前讨论过的合理性检查
           double z = tvec.at<double>(2);
-          if (z > 0.3 && z < 10.0) { // 简单的距离检查
+          if (z > 0.3 && z < 10.0) {
             RCLCPP_INFO(this->get_logger(), "PnP Succeeded! Distance: %.2f m", z);
             armor.camera_coordinates = cv::Point3f(tvec.at<double>(0), tvec.at<double>(1), z);
             armor.valid_pose = true;
@@ -504,7 +528,7 @@ private:
       for (int i = 0; i < 4; i++) {
         cv::line(result_frame, vertices[i], vertices[(i + 1) % 4], cv::Scalar(0, 255, 0), 3);
       }
-      
+
       // 绘制3D坐标信息
       if (armor.valid_pose) {
         std::string coord_text = cv::format("(%.2f,%.2f,%.2f)m", 
@@ -513,6 +537,15 @@ private:
                                           armor.camera_coordinates.z);
         cv::putText(result_frame, coord_text, armor.center + cv::Point2f(10, -10),
                    cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255, 255, 0), 2);
+      }
+
+      // 绘制数字识别信息
+      if (armor.number_valid) {
+        std::string number_text = cv::format("Num: %s (%.3f)", 
+                                          armor.detected_number.c_str(), 
+                                          armor.number_confidence);
+        cv::putText(result_frame, number_text, armor.center + cv::Point2f(10, 30),
+                  cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 255, 0), 2);
       }
       
       cv::circle(result_frame, armor.center, 5, cv::Scalar(0, 0, 255), -1);
@@ -528,7 +561,6 @@ private:
     frame_count_++;
     total_time_ += duration.count();
     if (frame_count_ >= 30) {
-      // 简化性能输出
       RCLCPP_INFO(this->get_logger(), "Frame processed - Lights: %d, Armors: %d", light_count, armor_count);
       frame_count_ = 0;
       total_time_ = 0;
@@ -539,14 +571,14 @@ private:
   image_transport::Subscriber subscription_;
   rclcpp::Subscription<sensor_msgs::msg::CameraInfo>::SharedPtr camera_info_sub_;
   image_transport::Publisher result_pub_;
-  image_transport::Publisher binary_pub_;  // 新增：二值化掩码图像发布者
+  image_transport::Publisher binary_pub_;
   rclcpp::Publisher<geometry_msgs::msg::PoseArray>::SharedPtr pose_pub_;
   
   int binary_thres_, detect_color_, min_contour_area_, max_contour_area_;
   bool debug_;
   double min_lightbar_ratio_, max_lightbar_ratio_, max_angle_diff_, max_height_diff_ratio_, max_tilt_angle_;
   double armor_height_extension_;
-  double number_height_extension_;  // 新增：数字检测区域高度扩展
+  double number_height_extension_;
   double armor_width_, armor_height_;
   
   cv::Mat camera_matrix_;

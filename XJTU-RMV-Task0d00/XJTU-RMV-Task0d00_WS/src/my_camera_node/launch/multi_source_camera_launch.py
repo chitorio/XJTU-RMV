@@ -23,7 +23,7 @@ def generate_launch_description():
     model_path_file = os.path.join(
         pkg_share,
         'model',
-        'model.onnx'
+        'mlp.onnx'
     )
     label_path_file = os.path.join(
         pkg_share,
@@ -87,7 +87,10 @@ def generate_launch_description():
             # --- 其他参数也可以在这里设置 ---
             # "pnp_update_rate": 3, 
             # "armor_width": 0.135,
-        }]
+        }],
+
+        # 调试日志
+        arguments=['--ros-args', '--log-level', 'info']
     )
 
     return LaunchDescription([

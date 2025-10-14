@@ -3,6 +3,7 @@
 
 #include <opencv2/opencv.hpp>
 #include <vector>
+#include <string>
 
 // 定义灯条结构体
 struct Light {
@@ -54,9 +55,15 @@ struct Armor {
   std::vector<cv::Point2f> corners;
   cv::Point3f camera_coordinates;
   bool valid_pose;
+
+  // 新增数字识别信息
+  std::string detected_number;
+  double number_confidence;
+  bool number_valid;
   
   Armor(const Light& l1, const Light& l2, const cv::RotatedRect& r) 
-    : left_light(l1), right_light(l2), rect(r), valid_pose(false) {
+    : left_light(l1), right_light(l2), rect(r), valid_pose(false),
+      number_valid(false), number_confidence(0.0) {
     center = (l1.center + l2.center) * 0.5f;
   }
 };

@@ -59,6 +59,11 @@ install(DIRECTORY launch config
   DESTINATION share/${PROJECT_NAME}/
 )
 
+# 新增：安装模型文件
+install(DIRECTORY model/
+  DESTINATION share/${PROJECT_NAME}/model
+)
+
 ament_auto_package(
   INSTALL_TO_SHARE
   launch
